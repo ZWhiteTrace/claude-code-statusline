@@ -120,6 +120,10 @@ STATUSLINE_DEBUG=1 ~/.claude/statusline.sh < test-input.json
 
 You can also inspect by piping the Claude Code JSON structure from a live session. See Claude Code's official statusline documentation for the input JSON schema.
 
+### Short model name
+
+Set `STATUSLINE_SHORT_MODEL=1` to strip the word `context` from the model display name. For example, `Opus 4.6 (1M context)` becomes `Opus 4.6 (1M)` — the context window size stays visible but the label is shorter. Unset (default) keeps the full model name.
+
 ### Refresh interval
 
 `refreshInterval` in `settings.json` (in seconds). A value like `30` balances freshness against script invocation cost. Lower values show live git/token updates more frequently but spawn the script more often.

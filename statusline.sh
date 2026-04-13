@@ -149,6 +149,8 @@ fi
 # ══════════════════════════════════════════════════════════════
 # LINE 1: Model + Repo:Branch + Context bar
 # ══════════════════════════════════════════════════════════════
+# Opt-in: strip " context" from model name (e.g. "Opus 4.6 (1M context)" -> "Opus 4.6 (1M)")
+[ "$STATUSLINE_SHORT_MODEL" = "1" ] && MODEL="${MODEL// context/}"
 L1=$(printf '[%s]' "$MODEL")
 [ -n "$REPO" ] && L1="${L1} ${REPO}"
 [ -n "$BRANCH" ] && L1="${L1}${DIM}:${BRANCH}${RST}"
