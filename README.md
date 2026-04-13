@@ -4,9 +4,9 @@ Fast, informative statusline for [Claude Code](https://docs.claude.com/en/docs/c
 
 ```
 [Opus 4.6 (1M context)] my-project:main │ Ctx: 5% ░░░░░░░░░░/1M
-5h: 44% ⟳2h4m │ 7d: 31% ⟳5d10h
+5h: 44% ⟳2h4m │ 7d: 31% ⟳5d10h │ $0.20
 in:343 out:18 │ Cache: 36% hit (r:17.5K w:30.7K) │ API 12%
-Session: 30s │ 1M │ $0.20 │ v2.1.104
+Session: 30s │ 1M │ v2.1.104
 ```
 
 Adapts automatically for cloud (Claude API) and local (Ollama) modes.
@@ -61,14 +61,14 @@ Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 [Opus 4.6 (1M context)] my-project:main │ Ctx: 5% ░░░░░░░░░░/1M
 │  Model name            │  Repo:Branch       │ Context window usage + bar + total size
 
-5h: 44% ⟳2h4m │ 7d: 31% ⟳5d10h
-│ 5-hour rate limit + time until reset │ 7-day rate limit + time until reset
+5h: 44% ⟳2h4m │ 7d: 31% ⟳5d10h │ $0.20
+│ 5-hour rate limit + time until reset │ 7-day rate limit + time until reset │ Session cost
 
 in:343 out:18 │ Cache: 36% hit (r:17.5K w:30.7K) │ API 12%
 │ Total in/out tokens  │ Cache hit rate (reads / writes) │ % of session spent on API calls
 
-Session: 30s │ 1M │ $0.20 │ v2.1.104
-│ Session duration │ Git: 1 Modified │ Session cost │ Claude Code version
+Session: 30s │ 1M │ v2.1.104
+│ Session duration │ Git: 1 Modified │ Claude Code version
 ```
 
 Conditional fields appear only when relevant:
@@ -167,9 +167,9 @@ The 4-line layout groups fields by semantic role so each line has a single theme
 | Line | Theme | Fields |
 |---|---|---|
 | L1 | **Identity & capacity** | Model, Repo:Branch, Context window |
-| L2 | **Rate limits** (cloud) or **Inference speed** (local) | 5h / 7d limits, or tok/s |
+| L2 | **Resource consumption** | 5h / 7d rate limits (or inference speed for local), session cost |
 | L3 | **Usage & cache** | Tokens in/out, cache hit rate, API wait % |
-| L4 | **Session state** | Duration, lines changed, git stats, worktree, agent, cost, version |
+| L4 | **Session state** | Duration, lines changed, git stats, worktree, agent, version |
 
 Each line stays under ~65 characters in typical sessions, so narrow terminal windows don't truncate.
 

@@ -154,8 +154,12 @@ L1=$(printf '[%s]' "$MODEL")
 [ -n "$BRANCH" ] && L1="${L1}${DIM}:${BRANCH}${RST}"
 L1="${L1} │ Ctx: $(cpct "$CTX_PCT") $(bar "$CTX_PCT")/${CTX_LABEL}"
 
+# Cost formatting (used on L2)
+COST_FMT=$(printf '$%.2f' "$COST")
+[ "$COST" = "0" ] || [ "$COST" = "0.0" ] && COST_FMT="${GRN}\$0.00${RST}"
+
 # ══════════════════════════════════════════════════════════════
-# LINE 2: Rate limits (cloud) OR Inference speed (local)
+# LINE 2: Rate limits (cloud) OR Inference speed (local) + Cost
 # ══════════════════════════════════════════════════════════════
 L2=""
 if [ -n "$FIVE_H_PCT" ] && [ "$FIVE_H_PCT" != "null" ]; then
@@ -172,6 +176,7 @@ else
     L2="Speed: waiting..."
   fi
 fi
+L2="${L2} │ ${COST_FMT}"
 
 # ══════════════════════════════════════════════════════════════
 # LINE 3: Tokens + Cache + API wait
@@ -181,17 +186,13 @@ L3="${L3} │ Cache: ${CACHE_HIT}% hit ${DIM}(r:$(fmt_tok "$CACHE_READ") w:$(fmt
 [ -n "$API_WAIT_PCT" ] && L3="${L3} │ ${DIM}API${RST} ${API_WAIT_PCT}"
 
 # ══════════════════════════════════════════════════════════════
-# LINE 4: Session + Lines + Git + Worktree + Agent + Cost + Version
+# LINE 4: Session + Lines + Git + Worktree + Agent + Version
 # ══════════════════════════════════════════════════════════════
-COST_FMT=$(printf '$%.2f' "$COST")
-[ "$COST" = "0" ] || [ "$COST" = "0.0" ] && COST_FMT="${GRN}\$0.00${RST}"
-
 L4="Session: $(fmt_dur "$DURATION_MS")"
 [ "$LINES_ADD" != "0" ] || [ "$LINES_DEL" != "0" ] && L4="${L4} │ ${GRN}+${LINES_ADD}${RST}/${RED}-${LINES_DEL}${RST}"
 [ -n "$GIT_STATS" ] && L4="${L4} │ ${GIT_STATS}"
 [ -n "$WORKTREE_NAME" ] && L4="${L4} │ ${CYN}🌿${WORKTREE_NAME}${RST}${DIM}:${WORKTREE_BRANCH}${RST}"
 [ -n "$AGENT" ] && L4="${L4} │ ${MAG}${AGENT}${RST}"
-L4="${L4} │ ${COST_FMT}"
 [ -n "$VERSION" ] && L4="${L4} │ ${DIM}v${VERSION}${RST}"
 
 # === Output ===
