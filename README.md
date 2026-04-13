@@ -39,7 +39,7 @@ This implementation makes **one** `jq` call using `@sh` to emit shell assignment
 | Timeout risk under load | High | Negligible |
 | Lines of extraction code | 25+ | 26 (one block) |
 
-Benchmarked on macOS 14 (Darwin 24.5.0), bash 3.2, jq 1.7.
+Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 
 ---
 
@@ -118,11 +118,11 @@ If the statusline looks wrong, run with `STATUSLINE_DEBUG=1` to see the expanded
 STATUSLINE_DEBUG=1 ~/.claude/statusline.sh < test-input.json
 ```
 
-You can also inspect by piping the Claude Code JSON structure from a live session. See [Claude Code statusline docs](https://docs.claude.com/en/docs/claude-code/statusline) for the input JSON schema.
+You can also inspect by piping the Claude Code JSON structure from a live session. See Claude Code's official statusline documentation for the input JSON schema.
 
 ### Refresh interval
 
-`refreshInterval` in `settings.json` (in seconds). Default `30`. Lower values show live git/token updates more frequently but spawn the script more often.
+`refreshInterval` in `settings.json` (in seconds). A value like `30` balances freshness against script invocation cost. Lower values show live git/token updates more frequently but spawn the script more often.
 
 ### Git stats caching
 
