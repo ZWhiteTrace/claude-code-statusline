@@ -3,7 +3,7 @@
 Fast, informative statusline for [Claude Code](https://docs.claude.com/en/docs/claude-code) — **~20x faster than common implementations**, with graceful fallback and built-in debug mode.
 
 ```
-[Opus 4.6 (1M context)] lobster-survivor:main │ Ctx: 5% ░░░░░░░░░░/1M
+[Opus 4.6 (1M context)] my-project:main │ Ctx: 5% ░░░░░░░░░░/1M
 5h: 44% ⟳2h4m │ 7d: 31% ⟳5d10h
 in:343 out:18 │ Cache: 36% hit (r:17.5K w:30.7K) │ API 12%
 Session: 30s │ 1M │ $0.20 │ v2.1.104
@@ -58,7 +58,7 @@ Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 ## Example output (annotated)
 
 ```
-[Opus 4.6 (1M context)] lobster-survivor:main │ Ctx: 5% ░░░░░░░░░░/1M
+[Opus 4.6 (1M context)] my-project:main │ Ctx: 5% ░░░░░░░░░░/1M
 │  Model name            │  Repo:Branch       │ Context window usage + bar + total size
 
 5h: 44% ⟳2h4m │ 7d: 31% ⟳5d10h

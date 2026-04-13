@@ -1,4 +1,23 @@
+# OS
 .DS_Store
+Thumbs.db
+
+# Backups & test artifacts
 *.bak
 *.bak.*
 test-input.json
+*.log
+
+# Secrets (defensive — nothing here should ever be committed)
+.env
+.env.*
+*.key
+*.pem
+*.p12
+.netrc
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
