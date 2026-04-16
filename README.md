@@ -47,6 +47,7 @@ Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 
 - **Single-pass JSON parsing** via `jq @sh` + `eval` — no repeated process spawn
 - **4-line layout** with semantic grouping (identity / rate limits / usage / session)
+- **Adaptive L1 width** — L1 auto-degrades through 5 levels (strip Ctx label → truncate branch → compact model name → drop repo) to fit narrow terminals. Long repo names use middle-ellipsis truncation
 - **Auto-adapts** for cloud Claude (shows 5h / 7d rate limits) vs local Ollama (shows inference tok/s)
 - **Git stats cached** to `/tmp` with 30-second TTL and lockfile-based concurrency control — works with 10+ simultaneous Claude Code sessions
 - **Graceful fallback** — if `jq` parsing fails, prints a minimal error line instead of breaking the UI
@@ -123,6 +124,18 @@ You can also inspect by piping the Claude Code JSON structure from a live sessio
 ### Short model name
 
 Set `STATUSLINE_SHORT_MODEL=1` to strip the word `context` from the model display name. For example, `Opus 4.6 (1M context)` becomes `Opus 4.6 (1M)` — the context window size stays visible but the label is shorter. Unset (default) keeps the full model name.
+
+### L1 width budget
+
+Set `STATUSLINE_MAX_WIDTH` (e.g., `75`) to cap L1 at a specific column width. The script picks the first degradation level that fits. Useful because Claude Code's statusline JSON does not include terminal width, and `tput cols` can't see the actual Claude Code pane size.
+
+Degradation order (least-to-most lossy):
+1. Strip `Ctx: ` label and `/1M` suffix (no info loss — redundant with bar + model name)
+2. Branch truncation max 24 → 16 chars
+3. Model name compact (`Opus 4.6 (1M)` → `O4.6·1M`)
+4. Drop repo name (still visible via branch context)
+
+Long repo names (>20 chars) are always truncated with a middle ellipsis (`dungeon-delvers-metadata-server` → `dungeon-de…ta-server`) regardless of level.
 
 ### Refresh interval
 

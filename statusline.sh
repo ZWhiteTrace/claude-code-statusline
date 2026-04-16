@@ -2,6 +2,9 @@
 # Claude Code Statusline v2 — auto-adapts for cloud (Claude) vs local (Ollama)
 # Git file stats cached to /tmp to avoid slow git calls in large repos
 
+# Force UTF-8 locale so ${#var} and wc -m count codepoints (not bytes)
+export LC_ALL="${LC_ALL:-en_US.UTF-8}" LANG="${LANG:-en_US.UTF-8}"
+
 input=$(cat)
 
 # === Extract all fields in ONE jq call (vs 20+ before) ===
@@ -31,6 +34,7 @@ SEVEN_D_RESET=\(.rate_limits.seven_day.resets_at // "")
 COST=\(.cost.total_cost_usd // 0)
 DURATION_MS=\(.cost.total_duration_ms // 0)
 API_DURATION_MS=\(.cost.total_api_duration_ms // 0)
+TERM_W=\(.terminal.width // 0)
 "' 2>&1)
 JQ_EXIT=$?
 
@@ -91,6 +95,53 @@ cpct() {
   fi
 }
 
+# === Helper: truncate long branch name (keeps prefix + suffix) ===
+trunc_branch() {
+  local b="$1" max=${2:-24}
+  local len=${#b}
+  [ $len -le $max ] && { echo "$b"; return; }
+  if [[ "$b" == */* ]]; then
+    local prefix="${b%%/*}"
+    local rest="${b#*/}"
+    local tail_len=$(( max - ${#prefix} - 2 ))
+    if [ $tail_len -gt 5 ]; then
+      echo "${prefix}/…${rest: -$tail_len}"
+      return
+    fi
+  fi
+  local head_len=$(( max / 2 ))
+  local tail_len=$(( max - head_len - 1 ))
+  echo "${b:0:$head_len}…${b: -$tail_len}"
+}
+
+# === Helper: truncate long repo name (middle ellipsis) ===
+trunc_repo() {
+  local r="$1" max=${2:-20}
+  local len=${#r}
+  [ $len -le $max ] && { echo "$r"; return; }
+  local head_len=$(( max / 2 ))
+  local tail_len=$(( max - head_len - 1 ))
+  echo "${r:0:$head_len}…${r: -$tail_len}"
+}
+
+# === Helper: compact model name (Opus 4.6 (1M) -> O4.6·1M) ===
+compact_model() {
+  local m="$1" ctx=""
+  [[ "$m" == *"(1M)"* ]] && ctx="·1M"
+  if [[ "$m" =~ ^([A-Za-z])[A-Za-z]+\ ([0-9.]+) ]]; then
+    echo "${BASH_REMATCH[1]}${BASH_REMATCH[2]}${ctx}"
+  else
+    echo "$m"
+  fi
+}
+
+# === Helper: visible length (strip ANSI, count codepoints) ===
+visible_len() {
+  local s
+  s=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*m//g')
+  echo "${#s}"
+}
+
 # === Helper: format token count ===
 fmt_tok() {
   local t=$1
@@ -147,14 +198,51 @@ if [ "$DURATION_MS" -gt 0 ] && [ "$API_DURATION_MS" -gt 0 ]; then
 fi
 
 # ══════════════════════════════════════════════════════════════
-# LINE 1: Model + Repo:Branch + Context bar
+# LINE 1: Model + Repo:Branch + Context bar (progressive degradation)
 # ══════════════════════════════════════════════════════════════
-# Opt-in: strip " context" from model name (e.g. "Opus 4.6 (1M context)" -> "Opus 4.6 (1M)")
 [ "$STATUSLINE_SHORT_MODEL" = "1" ] && MODEL="${MODEL// context/}"
-L1=$(printf '[%s]' "$MODEL")
-[ -n "$REPO" ] && L1="${L1} ${REPO}"
-[ -n "$BRANCH" ] && L1="${L1}${DIM}:${BRANCH}${RST}"
-L1="${L1} │ Ctx: $(cpct "$CTX_PCT") $(bar "$CTX_PCT")/${CTX_LABEL}"
+
+# Terminal width budget:
+#   1. STATUSLINE_MAX_WIDTH env var (user override, hard cap)
+#   2. .terminal.width from JSON
+#   3. tput cols / $COLUMNS
+#   4. fallback 120
+COLS=${STATUSLINE_MAX_WIDTH:-$TERM_W}
+[ "$COLS" = "0" ] || [ -z "$COLS" ] && COLS=$({ tput cols 2>/dev/null; } || echo "${COLUMNS:-120}")
+L1_BUDGET=$(( COLS - 2 ))
+
+# Build L1 at a given degradation level (0=full, 4=most compact).
+# Order: least lossy first — strip decorations before sacrificing signal.
+#   L1: Ctx label+suffix (pure decoration, no info loss)
+#   L2: Branch trunc 24→16 (mid-branch ellipsis, small loss)
+#   L3: Model compact (Opus 4.6 (1M) → O4.6·1M, medium loss)
+#   L4: Drop repo name (can be inferred from CWD, largest loss)
+build_l1() {
+  local level=$1
+  local m="$MODEL" bmax=24 show_repo=1 ctx_verbose=1
+  [ $level -ge 1 ] && ctx_verbose=0
+  [ $level -ge 2 ] && bmax=16
+  [ $level -ge 3 ] && m=$(compact_model "$MODEL")
+  [ $level -ge 4 ] && show_repo=0
+
+  local L
+  L=$(printf '[%s]' "$m")
+  [ $show_repo -eq 1 ] && [ -n "$REPO" ] && L="${L} $(trunc_repo "$REPO")"
+  [ -n "$BRANCH" ] && L="${L}${DIM}:$(trunc_branch "$BRANCH" "$bmax")${RST}"
+  if [ $ctx_verbose -eq 1 ]; then
+    L="${L} │ Ctx: $(cpct "$CTX_PCT") $(bar "$CTX_PCT")/${CTX_LABEL}"
+  else
+    L="${L} │ $(cpct "$CTX_PCT")$(bar "$CTX_PCT")"
+  fi
+  echo "$L"
+}
+
+# Pick lowest degradation level that fits budget
+for _level in 0 1 2 3 4; do
+  L1=$(build_l1 $_level)
+  LEN=$(visible_len "$L1")
+  [ "$LEN" -le "$L1_BUDGET" ] && break
+done
 
 # Cost formatting (used on L2)
 COST_FMT=$(printf '$%.2f' "$COST")
