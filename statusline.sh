@@ -51,7 +51,7 @@ GRN='\033[32m'; YLW='\033[33m'; RED='\033[31m'; CYN='\033[36m'; MAG='\033[35m'
 
 # === Helper: context bar ===
 bar() {
-  local pct=$1 width=10
+  local pct=$1 width=5
   local filled=$(( pct * width / 100 ))
   local empty=$(( width - filled ))
   local b=""
