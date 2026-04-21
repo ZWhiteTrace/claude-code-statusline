@@ -135,11 +135,30 @@ compact_model() {
   fi
 }
 
-# === Helper: visible length (strip ANSI, count codepoints) ===
+# === Helper: visible length (strip ANSI, count codepoints + wide-char compensation) ===
+# Wide chars (emoji like 🌿) take 2 display cols but 1 codepoint — add +1 each.
+# Currently only 🌿 is emitted; extend this if more wide chars are used.
 visible_len() {
   local s
   s=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*m//g')
-  echo "${#s}"
+  local stripped="${s//🌿/}"
+  local wide=$(( ${#s} - ${#stripped} ))
+  echo $(( ${#s} + wide ))
+}
+
+# === Helper: safety-net truncation when max degradation still overruns budget ===
+# Strips ANSI (loses color) and truncates to BUDGET-1 + ellipsis. Prevents
+# terminal-side wrap/truncation at the cost of losing color on extreme-narrow panes.
+clamp_line() {
+  local line=$1 budget=$2
+  [ "$budget" -lt 4 ] && { echo "$line"; return; }
+  if [ "$(visible_len "$line")" -gt "$budget" ]; then
+    local plain
+    plain=$(printf '%b' "$line" | sed $'s/\x1b\\[[0-9;]*m//g')
+    echo "${plain:0:$((budget-1))}…"
+  else
+    echo "$line"
+  fi
 }
 
 # === Helper: format token count ===
@@ -202,14 +221,57 @@ fi
 # ══════════════════════════════════════════════════════════════
 [ "$STATUSLINE_SHORT_MODEL" = "1" ] && MODEL="${MODEL// context/}"
 
-# Terminal width budget:
-#   1. STATUSLINE_MAX_WIDTH env var (user override, hard cap)
-#   2. .terminal.width from JSON
-#   3. tput cols / $COLUMNS
-#   4. fallback 120
-COLS=${STATUSLINE_MAX_WIDTH:-$TERM_W}
-[ "$COLS" = "0" ] || [ -z "$COLS" ] && COLS=$({ tput cols 2>/dev/null; } || echo "${COLUMNS:-120}")
-L1_BUDGET=$(( COLS - 2 ))
+# Terminal width detection (priority, since CC's .terminal.width is often 0
+# and `tput cols` returns non-TTY default 80 — both lie):
+#   1. .terminal.width from JSON (authoritative if CC provides it)
+#   2. stty size </dev/tty (most reliable for actual pane width)
+#   3. tput cols (unreliable, only used if sane)
+#   4. $COLUMNS env
+#   5. Fallback 80
+ACTUAL_COLS=${TERM_W:-0}
+
+# Probe stty + tput once upfront — used by fallback chain and reused by debug log.
+# Wrap in { ... } 2>/dev/null so shell redirection errors from </dev/tty are swallowed
+# in headless/no-TTY environments (CI, Docker without -t) where /dev/tty is absent.
+STTY_COLS=$({ stty size </dev/tty 2>/dev/null; } 2>/dev/null | awk '{print $2}')
+TPUT_COLS=$(tput cols 2>/dev/null)
+
+if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
+  if [ -n "$STTY_COLS" ] && [ "$STTY_COLS" -ge 10 ] && [ "$STTY_COLS" -le 500 ] 2>/dev/null; then
+    ACTUAL_COLS=$STTY_COLS
+  fi
+fi
+
+if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
+  if [ -n "$TPUT_COLS" ] && [ "$TPUT_COLS" -ge 10 ] 2>/dev/null; then
+    ACTUAL_COLS=$TPUT_COLS
+  fi
+fi
+
+if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
+  ACTUAL_COLS=${COLUMNS:-80}
+fi
+
+# Soft cap via STATUSLINE_MAX_WIDTH (only when actual wider than cap)
+if [ -n "$STATUSLINE_MAX_WIDTH" ] && [ "$STATUSLINE_MAX_WIDTH" -gt 0 ] && [ "$ACTUAL_COLS" -gt "$STATUSLINE_MAX_WIDTH" ]; then
+  COLS=$STATUSLINE_MAX_WIDTH
+else
+  COLS=$ACTUAL_COLS
+fi
+
+# Chrome padding: CC's statusline render area has L+R padding that eats cols.
+# Observed ~4-5 cols eaten (stty reports 39 but render truncates at ~34).
+# Tunable via STATUSLINE_CHROME_PAD env.
+CHROME_PAD=${STATUSLINE_CHROME_PAD:-5}
+BUDGET=$(( COLS - CHROME_PAD ))
+L1_BUDGET=$BUDGET
+
+# Diagnosis log (only when STATUSLINE_DEBUG=1) — uses cached probes, no extra subprocess
+if [ -n "$STATUSLINE_DEBUG" ]; then
+  {
+    echo "$(date +%H:%M:%S) TERM_W=$TERM_W stty_cols=${STTY_COLS:-na} tput_cols=${TPUT_COLS:-na} COLUMNS=${COLUMNS:-unset} ACTUAL=$ACTUAL_COLS MAX=${STATUSLINE_MAX_WIDTH:-unset} PAD=$CHROME_PAD -> COLS=$COLS BUDGET=$BUDGET"
+  } >> /tmp/statusline-diag.log 2>/dev/null
+fi
 
 # Build L1 at a given degradation level (0=full, 4=most compact).
 # Order: least lossy first — strip decorations before sacrificing signal.
@@ -243,6 +305,7 @@ for _level in 0 1 2 3 4; do
   LEN=$(visible_len "$L1")
   [ "$LEN" -le "$L1_BUDGET" ] && break
 done
+L1=$(clamp_line "$L1" "$L1_BUDGET")
 
 # Cost formatting (used on L2)
 COST_FMT=$(printf '$%.2f' "$COST")
@@ -250,40 +313,111 @@ COST_FMT=$(printf '$%.2f' "$COST")
 
 # ══════════════════════════════════════════════════════════════
 # LINE 2: Rate limits (cloud) OR Inference speed (local) + Cost
+# Progressive degradation:
+#   L0: full   L1: drop reset countdown / drop API duration
+#   L2: drop 7d (cloud only)   L3: only cost
 # ══════════════════════════════════════════════════════════════
-L2=""
-if [ -n "$FIVE_H_PCT" ] && [ "$FIVE_H_PCT" != "null" ]; then
-  FIVE_INT=$(echo "$FIVE_H_PCT" | cut -d. -f1)
-  SEVEN_INT=$(echo "$SEVEN_D_PCT" | cut -d. -f1)
-  L2="5h: $(cpct "$FIVE_INT") ⟳$(fmt_reset "$FIVE_H_RESET") │ 7d: $(cpct "$SEVEN_INT") ⟳$(fmt_reset "$SEVEN_D_RESET")"
-else
-  if [ "$API_DURATION_MS" -gt 0 ]; then
-    API_SEC=$(echo "scale=1; $API_DURATION_MS / 1000" | bc 2>/dev/null || echo "0")
-    TPS="?"
-    [ "$API_SEC" != "0" ] && [ "$API_SEC" != "0.0" ] && TPS=$(echo "scale=1; $OUT_TOKENS / $API_SEC" | bc 2>/dev/null || echo "?")
-    L2="Speed: ${CYN}${TPS} tok/s${RST} │ API: $(fmt_dur "$API_DURATION_MS")"
-  else
-    L2="Speed: waiting..."
-  fi
+FIVE_INT=$(echo "$FIVE_H_PCT" | cut -d. -f1)
+SEVEN_INT=$(echo "$SEVEN_D_PCT" | cut -d. -f1)
+API_SEC=0
+TPS="?"
+if [ "$API_DURATION_MS" -gt 0 ]; then
+  API_SEC=$(echo "scale=1; $API_DURATION_MS / 1000" | bc 2>/dev/null || echo "0")
+  [ "$API_SEC" != "0" ] && [ "$API_SEC" != "0.0" ] && TPS=$(echo "scale=1; $OUT_TOKENS / $API_SEC" | bc 2>/dev/null || echo "?")
 fi
-L2="${L2} │ ${COST_FMT}"
+
+build_l2() {
+  local level=$1
+  [ $level -ge 3 ] && { echo "$COST_FMT"; return; }
+  local L=""
+  if [ -n "$FIVE_H_PCT" ] && [ "$FIVE_H_PCT" != "null" ]; then
+    L="5h: $(cpct "$FIVE_INT")"
+    [ $level -lt 1 ] && L="${L} ⟳$(fmt_reset "$FIVE_H_RESET")"
+    if [ $level -lt 2 ]; then
+      L="${L} │ 7d: $(cpct "$SEVEN_INT")"
+      [ $level -lt 1 ] && L="${L} ⟳$(fmt_reset "$SEVEN_D_RESET")"
+    fi
+  else
+    if [ "$API_DURATION_MS" -gt 0 ]; then
+      L="Speed: ${CYN}${TPS} tok/s${RST}"
+      [ $level -lt 1 ] && L="${L} │ API: $(fmt_dur "$API_DURATION_MS")"
+    else
+      L="Speed: waiting..."
+    fi
+  fi
+  echo "${L} │ ${COST_FMT}"
+}
+
+for _lvl in 0 1 2 3; do
+  L2=$(build_l2 $_lvl)
+  [ "$(visible_len "$L2")" -le "$BUDGET" ] && break
+done
+L2=$(clamp_line "$L2" "$BUDGET")
 
 # ══════════════════════════════════════════════════════════════
 # LINE 3: Tokens + Cache + API wait
+# Progressive degradation:
+#   L0: full   L1: drop API wait
+#   L2: drop cache r/w detail   L3: drop in/out tokens (cache hit % only)
 # ══════════════════════════════════════════════════════════════
-L3="${DIM}in:${RST}${CYN}$(fmt_tok "$TOTAL_IN")${RST} ${DIM}out:${RST}${MAG}$(fmt_tok "$TOTAL_OUT")${RST}"
-L3="${L3} │ Cache: ${CACHE_HIT}% hit ${DIM}(r:$(fmt_tok "$CACHE_READ") w:$(fmt_tok "$CACHE_CREATE"))${RST}"
-[ -n "$API_WAIT_PCT" ] && L3="${L3} │ ${DIM}API${RST} ${API_WAIT_PCT}"
+build_l3() {
+  local level=$1
+  local L=""
+  if [ $level -lt 3 ]; then
+    L="${DIM}in:${RST}${CYN}$(fmt_tok "$TOTAL_IN")${RST} ${DIM}out:${RST}${MAG}$(fmt_tok "$TOTAL_OUT")${RST}"
+  fi
+  local cache_seg="Cache: ${CACHE_HIT}% hit"
+  [ $level -lt 2 ] && cache_seg="${cache_seg} ${DIM}(r:$(fmt_tok "$CACHE_READ") w:$(fmt_tok "$CACHE_CREATE"))${RST}"
+  if [ -n "$L" ]; then L="${L} │ ${cache_seg}"; else L="$cache_seg"; fi
+  [ $level -lt 1 ] && [ -n "$API_WAIT_PCT" ] && L="${L} │ ${DIM}API${RST} ${API_WAIT_PCT}"
+  echo "$L"
+}
+
+for _lvl in 0 1 2 3; do
+  L3=$(build_l3 $_lvl)
+  [ "$(visible_len "$L3")" -le "$BUDGET" ] && break
+done
+L3=$(clamp_line "$L3" "$BUDGET")
 
 # ══════════════════════════════════════════════════════════════
 # LINE 4: Session + Lines + Git + Worktree + Agent + Version
+# Progressive degradation (drop least important first):
+#   L0: full   L1: drop version   L2: drop session duration
+#   L3: drop agent   L4: drop worktree
+#   Git stats + lines +/- always shown (if present) — highest signal
 # ══════════════════════════════════════════════════════════════
-L4="Session: $(fmt_dur "$DURATION_MS")"
-[ "$LINES_ADD" != "0" ] || [ "$LINES_DEL" != "0" ] && L4="${L4} │ ${GRN}+${LINES_ADD}${RST}/${RED}-${LINES_DEL}${RST}"
-[ -n "$GIT_STATS" ] && L4="${L4} │ ${GIT_STATS}"
-[ -n "$WORKTREE_NAME" ] && L4="${L4} │ ${CYN}🌿${WORKTREE_NAME}${RST}${DIM}:${WORKTREE_BRANCH}${RST}"
-[ -n "$AGENT" ] && L4="${L4} │ ${MAG}${AGENT}${RST}"
-[ -n "$VERSION" ] && L4="${L4} │ ${DIM}v${VERSION}${RST}"
+build_l4() {
+  local level=$1
+  local show_ver=1 show_session=1 show_agent=1 show_wt=1
+  [ $level -ge 1 ] && show_ver=0
+  [ $level -ge 2 ] && show_session=0
+  [ $level -ge 3 ] && show_agent=0
+  [ $level -ge 4 ] && show_wt=0
+
+  local parts=()
+  [ $show_session -eq 1 ] && parts+=("Session: $(fmt_dur "$DURATION_MS")")
+  if [ "$LINES_ADD" != "0" ] || [ "$LINES_DEL" != "0" ]; then
+    parts+=("${GRN}+${LINES_ADD}${RST}/${RED}-${LINES_DEL}${RST}")
+  fi
+  [ -n "$GIT_STATS" ] && parts+=("$GIT_STATS")
+  [ $show_wt -eq 1 ] && [ -n "$WORKTREE_NAME" ] && parts+=("${CYN}🌿${WORKTREE_NAME}${RST}${DIM}:${WORKTREE_BRANCH}${RST}")
+  [ $show_agent -eq 1 ] && [ -n "$AGENT" ] && parts+=("${MAG}${AGENT}${RST}")
+  [ $show_ver -eq 1 ] && [ -n "$VERSION" ] && parts+=("${DIM}v${VERSION}${RST}")
+
+  local L=""
+  if [ ${#parts[@]} -gt 0 ]; then
+    for p in "${parts[@]}"; do
+      if [ -n "$L" ]; then L="${L} │ ${p}"; else L="$p"; fi
+    done
+  fi
+  echo "$L"
+}
+
+for _lvl in 0 1 2 3 4; do
+  L4=$(build_l4 $_lvl)
+  [ "$(visible_len "$L4")" -le "$BUDGET" ] && break
+done
+L4=$(clamp_line "$L4" "$BUDGET")
 
 # === Output ===
 echo -e "$L1"
