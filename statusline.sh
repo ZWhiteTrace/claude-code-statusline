@@ -226,7 +226,7 @@ fi
 #   1. .terminal.width from JSON (authoritative if CC provides it)
 #   2. stty size </dev/tty (most reliable for actual pane width)
 #   3. tput cols (unreliable, only used if sane)
-#   4. $COLUMNS env
+#   4. $COLUMNS env (CC ≥ 2.1.153 always exports, may be 0 in non-TTY subprocs)
 #   5. Fallback 80
 ACTUAL_COLS=${TERM_W:-0}
 
@@ -249,7 +249,11 @@ if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
 fi
 
 if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
-  ACTUAL_COLS=${COLUMNS:-80}
+  if [ -n "$COLUMNS" ] && [ "$COLUMNS" -gt 0 ] 2>/dev/null; then
+    ACTUAL_COLS=$COLUMNS
+  else
+    ACTUAL_COLS=80
+  fi
 fi
 
 # Soft cap via STATUSLINE_MAX_WIDTH (only when actual wider than cap)
