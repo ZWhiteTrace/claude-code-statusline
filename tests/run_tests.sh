@@ -21,10 +21,15 @@ FAIL=0
 # STATUSLINE_MAX_WIDTH is unset here so COLUMNS alone drives the budget; it has
 # its own case below.
 REPO_CWD="${STATUSLINE_TEST_CWD:-$DIR/..}"
+# Pin every input the width maths depends on, rather than inheriting it. $PAD is
+# compared against the script's own padding, so letting the script read a
+# different STATUSLINE_CHROME_PAD from the environment makes every case that
+# fills its budget fail by exactly that difference — which is what happened the
+# day the user's settings.json changed the value from 5 to 4.
 render() (
   cd "$REPO_CWD" 2>/dev/null || cd "$DIR"
-  unset STATUSLINE_MAX_WIDTH
-  COLUMNS="$2" bash "$SL" <<<"$1"
+  unset STATUSLINE_MAX_WIDTH STATUSLINE_SHORT_MODEL STATUSLINE_DEBUG
+  STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
 )
 
 mut() { jq -c "$1" "$REAL"; }

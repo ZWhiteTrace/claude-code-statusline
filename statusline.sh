@@ -425,14 +425,40 @@ fi
 #         read off the last digit still visible, multiply by 10
 #         rm ~/.claude/.statusline-ruler      → back to normal
 if [ -f "$HOME/.claude/.statusline-ruler" ]; then
+  # Marks every 10th column. Past 90 the marks continue as letters rather than
+  # wrapping back to 0-9: a bare "2" would be ambiguous between column 20 and
+  # column 120, which is exactly the range this measurement cares about.
   _rule=""
   for ((_i = 1; _i <= ACTUAL_COLS; _i++)); do
-    if [ $((_i % 10)) -eq 0 ]; then _rule+="$(( (_i / 10) % 10 ))"; else _rule+="."; fi
+    if [ $((_i % 10)) -eq 0 ]; then
+      _n=$(( _i / 10 ))
+      if [ "$_n" -le 9 ]; then
+        _rule+="$_n"
+      else
+        _rule+=$(printf "\\$(printf '%03o' $(( 87 + _n )))")   # 10->a, 11->b, ...
+      fi
+    else
+      _rule+="."
+    fi
   done
+  # Second ruler, exactly BUDGET wide. Claude Code truncates an over-long line
+  # and appends its own ellipsis, so this one ending in "]" rather than in that
+  # ellipsis is the proof that the current padding fits.
+  _check=""
+  for ((_i = 1; _i <= BUDGET - 1; _i++)); do
+    if [ $((_i % 10)) -eq 0 ]; then
+      _n=$(( _i / 10 ))
+      if [ "$_n" -le 9 ]; then _check+="$_n"; else _check+=$(printf "\\$(printf '%03o' $(( 87 + _n )))"); fi
+    else
+      _check+="="
+    fi
+  done
+  _check+="]"
+
   echo "$_rule"
-  echo "COLUMNS=$ACTUAL_COLS · last visible digit above x10 = real usable width"
-  echo "current CHROME_PAD=$CHROME_PAD -> BUDGET=$BUDGET (set STATUSLINE_CHROME_PAD to change)"
-  echo "rm ~/.claude/.statusline-ruler to exit calibration"
+  echo "$_check"
+  echo "line1 = COLUMNS ($ACTUAL_COLS). Its last visible mark is the real usable width."
+  echo "line2 = current BUDGET ($BUDGET). It must end in ] — if it ends in an ellipsis, CHROME_PAD is too small."
   exit 0
 fi
 
@@ -447,9 +473,14 @@ fi
 # signals on this line that the rest of the status line cannot imply.
 build_l1() {
   local level=$1
-  local m="$MODEL" bmax=24 show_repo=1 ctx_verbose=1 eff_full=1
+  # rmax starts at 32, not at the old fixed 20. That 20 was chosen when the line
+  # had ~70 columns to work with; with the budget now measured rather than
+  # guessed there is room for a full repository name, and truncating one that
+  # fits is the same kind of loss as the hard-coded width cap this replaced.
+  # It still drops back to 20 as soon as the ladder starts compressing.
+  local m="$MODEL" bmax=24 rmax=32 show_repo=1 ctx_verbose=1 eff_full=1
   [ $level -ge 1 ] && ctx_verbose=0
-  [ $level -ge 2 ] && bmax=16
+  [ $level -ge 2 ] && { bmax=16; rmax=20; }
   [ $level -ge 3 ] && eff_full=0
   [ $level -ge 4 ] && m=$(compact_model "$MODEL")
   [ $level -ge 5 ] && show_repo=0
@@ -481,7 +512,7 @@ build_l1() {
   # Build repo and branch together so dropping the repo does not leave the
   # branch's ":" separator dangling off the model segment ("[O5·X]:main").
   local loc=""
-  [ $show_repo -eq 1 ] && [ -n "$REPO" ] && loc="$(trunc_repo "$REPO")"
+  [ $show_repo -eq 1 ] && [ -n "$REPO" ] && loc="$(trunc_repo "$REPO" "$rmax")"
   if [ -n "$BRANCH" ]; then
     if [ -n "$loc" ]; then
       loc="${loc}${DIM}:$(trunc_branch "$BRANCH" "$bmax")${RST}"
