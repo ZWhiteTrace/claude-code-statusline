@@ -34,7 +34,27 @@ SEVEN_D_RESET=\(.rate_limits.seven_day.resets_at // "")
 COST=\(.cost.total_cost_usd // 0)
 DURATION_MS=\(.cost.total_duration_ms // 0)
 API_DURATION_MS=\(.cost.total_api_duration_ms // 0)
-TERM_W=\(.terminal.width // 0)
+SPEND_PCT=\(.rate_limits.spend_limit.used_percentage // "")
+SPEND_RESET=\(.rate_limits.spend_limit.resets_at // "")
+EXCEEDS_200K=\(.exceeds_200k_tokens // false)
+EFFORT=\(.effort.level // "")
+FAST_MODE=\(.fast_mode // false)
+THINKING=\(if .thinking.enabled == false then "false" else "true" end)
+REPO_NAME=\(.workspace.repo.name // "")
+GIT_WORKTREE=\(.workspace.git_worktree // "")
+PR_NUM=\(if (.pr.number // 0) > 0 then (.pr.number | tostring) else "" end)
+PR_STATE=\(.pr.review_state // "")
+PR_KIND=\(.pr.kind // "")
+PC_PRESENT=\(if .prompt_cache then 1 else 0 end)
+PC_OBSERVED=\(.prompt_cache.caching_observed // false)
+PC_WARM=\(.prompt_cache.warm // false)
+PC_TTL=\(.prompt_cache.ttl // "")
+PC_EXPIRES=\(.prompt_cache.expires_at // "")
+PC_HIT=\(if .prompt_cache.hit_ratio == null then "" else (.prompt_cache.hit_ratio * 100 | floor) end)
+PC_MISSES=\(.prompt_cache.misses // 0)
+PC_REBUILDS=\(.prompt_cache.expected_rebuilds // 0)
+PC_RECACHE=\(.prompt_cache.recache_tokens_if_cold // "")
+PC_CAUSE=\((try (.prompt_cache.last_miss_cause.causes) catch null) | if type == "array" then join(",") else "" end)
 "' 2>&1)
 JQ_EXIT=$?
 
@@ -50,8 +70,14 @@ fi
 eval "$JQ_OUT"
 
 # === Colors ===
-RST='\033[0m'; DIM='\033[2m'
-GRN='\033[32m'; YLW='\033[33m'; RED='\033[31m'; CYN='\033[36m'; MAG='\033[35m'
+# Real ESC bytes, not the literal two-character sequence "\033". With the literal
+# form every line had to be emitted through `echo -e` / `printf %b`, and those
+# also expand escapes inside payload-supplied strings. A git worktree directory
+# named `aa\nbb` then split line 4 into two and broke the exactly-four-lines
+# contract; `aa\cbb` truncated the output entirely. (git rejects such *branch*
+# names, but a worktree directory name allows them.)
+RST=$'\033[0m'; DIM=$'\033[2m'
+GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; CYN=$'\033[36m'; MAG=$'\033[35m'
 
 # === Helper: context bar ===
 bar() {
@@ -88,11 +114,14 @@ fmt_reset() {
 
 # === Helper: color by percentage (returns colored string) ===
 cpct() {
-  local pct=$1
-  if [ "$pct" -ge 80 ]; then printf "${RED}%s%%${RST}" "$pct"
-  elif [ "$pct" -ge 50 ]; then printf "${YLW}%s%%${RST}" "$pct"
-  else printf "${GRN}%s%%${RST}" "$pct"
+  local pct=$1 c
+  if   [ "$pct" -ge 80 ]; then c=$RED
+  elif [ "$pct" -ge 50 ]; then c=$YLW
+  else c=$GRN
   fi
+  # Colour goes through %s, never into the format string: a format string built
+  # from data is a bug waiting for the first value containing a percent sign.
+  printf '%s%s%%%s' "$c" "$pct" "$RST"
 }
 
 # === Helper: truncate long branch name (keeps prefix + suffix) ===
@@ -136,14 +165,45 @@ compact_model() {
 }
 
 # === Helper: visible length (strip ANSI, count codepoints + wide-char compensation) ===
-# Wide chars (emoji like 🌿) take 2 display cols but 1 codepoint — add +1 each.
-# Currently only 🌿 is emitted; extend this if more wide chars are used.
+# Wide (2 display columns, 1 codepoint) chars that the builders emit THEMSELVES.
+# visible_len and clamp_line both read this list, so those two cannot disagree.
+#
+# It does NOT cover wide characters arriving in payload strings — a repo, branch,
+# worktree or agent name in CJK is counted as one column per character and the
+# line overruns silently (measured: a 9-character Chinese repo name overshoots by
+# 5 columns). Handling that needs a real East Asian Width table rather than a
+# glyph list, which is why the subagent status line hands its measuring to perl.
+# skipped: full East Asian Width handling here, add when a repo/branch/worktree
+# name in CJK actually causes a visible wrap — the cost is a perl fork on a hot
+# path, and this user's repo and branch names are ASCII.
+#
+# The literals below are checked: ⚡ U+26A1 and 🌿 U+1F33F are the only EAW=W
+# glyphs the builders produce. ✓ ✗ ⟳ ░ are Neutral; █ │ · … are Ambiguous, which
+# this script (like the terminals it targets) renders as one column.
+WIDE_CHARS='🌿⚡'
+
 visible_len() {
-  local s
-  s=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*m//g')
-  local stripped="${s//🌿/}"
-  local wide=$(( ${#s} - ${#stripped} ))
-  echo $(( ${#s} + wide ))
+  local s stripped i ch
+  s=$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$1")
+  stripped="$s"
+  for ((i = 0; i < ${#WIDE_CHARS}; i++)); do
+    ch="${WIDE_CHARS:$i:1}"
+    stripped="${stripped//"$ch"/}"
+  done
+  # length + one extra column per wide char
+  echo $(( ${#s} + ${#s} - ${#stripped} ))
+}
+
+# === Helper: compact effort level (xhigh -> X) ===
+compact_effort() {
+  case "$1" in
+    low)    echo "l" ;;
+    medium) echo "m" ;;
+    high)   echo "h" ;;
+    xhigh)  echo "X" ;;
+    max)    echo "M" ;;
+    *)      echo "$1" ;;
+  esac
 }
 
 # === Helper: safety-net truncation when max degradation still overruns budget ===
@@ -152,13 +212,25 @@ visible_len() {
 clamp_line() {
   local line=$1 budget=$2
   [ "$budget" -lt 4 ] && { echo "$line"; return; }
-  if [ "$(visible_len "$line")" -gt "$budget" ]; then
-    local plain
-    plain=$(printf '%b' "$line" | sed $'s/\x1b\\[[0-9;]*m//g')
-    echo "${plain:0:$((budget-1))}…"
-  else
+  if [ "$(visible_len "$line")" -le "$budget" ]; then
     echo "$line"
+    return
   fi
+  local plain
+  plain=$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$line")
+  # Truncate by DISPLAY width, not by codepoint count. Slicing N codepoints of a
+  # string holding W wide chars yields N+W columns, so a codepoint slice sized to
+  # the budget still overruns it — by exactly the number of wide chars kept.
+  local out="" w=0 ch cw i
+  for ((i = 0; i < ${#plain}; i++)); do
+    ch="${plain:$i:1}"
+    cw=1
+    [[ "$WIDE_CHARS" == *"$ch"* ]] && cw=2
+    [ $(( w + cw )) -gt $(( budget - 1 )) ] && break
+    out+="$ch"
+    w=$(( w + cw ))
+  done
+  echo "${out}…"
 }
 
 # === Helper: format token count ===
@@ -175,7 +247,13 @@ fmt_tok() {
 BRANCH="" REPO="" GIT_STATS=""
 if git rev-parse --git-dir > /dev/null 2>&1; then
   BRANCH=$(git branch --show-current 2>/dev/null)
-  REPO=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
+  # workspace.repo.name is parsed by CC from the origin remote — free, no fork.
+  # It is absent without an origin remote, so keep the git call as the fallback.
+  if [ -n "$REPO_NAME" ]; then
+    REPO="$REPO_NAME"
+  else
+    REPO=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
+  fi
 
   # Git file stats: cache for 30 seconds + lock to handle 10+ concurrent sessions
   GIT_HASH=$(echo "$CWD" | md5 -q 2>/dev/null || echo "$CWD" | md5sum 2>/dev/null | cut -d' ' -f1)
@@ -189,13 +267,32 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
     touch "$GIT_LOCK" 2>/dev/null
     GIT_M=$(git diff --name-only 2>/dev/null | wc -l | tr -d ' ')
     GIT_A=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
-    PARTS=""
-    [ "$GIT_M" -gt 0 ] && PARTS="${YLW}${GIT_M}M${RST}"
-    [ "$GIT_A" -gt 0 ] && { [ -n "$PARTS" ] && PARTS="${PARTS} "; PARTS="${PARTS}${GRN}${GIT_A}A${RST}"; }
-    echo "$PARTS" > "$GIT_CACHE"
+    # Cache the NUMBERS, never the rendered string. A cache holding rendered
+    # output outlives the code that rendered it: when the colour constants moved
+    # from the literal "\033" to real ESC bytes, entries written by the previous
+    # version were printed verbatim as `\033[33m1M\033[0m` and measured as seven
+    # visible characters each, which pushed line 4 over budget and silently
+    # dropped the version segment.
+    echo "$GIT_M $GIT_A" > "$GIT_CACHE"
     rm -f "$GIT_LOCK" 2>/dev/null
   fi
-  GIT_STATS=$(cat "$GIT_CACHE" 2>/dev/null)
+
+  _gm=""; _ga=""
+  if [ -f "$GIT_CACHE" ]; then
+    read -r _gm _ga < "$GIT_CACHE" 2>/dev/null
+    # Reject anything that is not two integers — that is an entry written by the
+    # pre-change version, in the rendered-string format.
+    case "${_gm}:${_ga}" in
+      *[!0-9:]*) _gm=""; _ga="" ;;
+    esac
+  fi
+  if [ -n "$_gm" ] && [ "$_gm" -gt 0 ] 2>/dev/null; then
+    GIT_STATS="${YLW}${_gm}M${RST}"
+  fi
+  if [ -n "$_ga" ] && [ "$_ga" -gt 0 ] 2>/dev/null; then
+    [ -n "$GIT_STATS" ] && GIT_STATS="${GIT_STATS} "
+    GIT_STATS="${GIT_STATS}${GRN}${_ga}A${RST}"
+  fi
 fi
 
 # === Context size label ===
@@ -205,10 +302,30 @@ else CTX_LABEL="$(( CTX_SIZE / 1000 ))K"
 fi
 
 # === Cache hit rate ===
+# Fallback: derived from the LAST response only, and it counts subagent traffic
+# the same as main-conversation traffic.
 CACHE_TOTAL=$(( CACHE_CREATE + CACHE_READ + INPUT_TOKENS ))
 if [ "$CACHE_TOTAL" -gt 0 ]; then CACHE_HIT=$(( CACHE_READ * 100 / CACHE_TOTAL ))
 else CACHE_HIT=0
 fi
+# Preferred: CC's own figure (v2.1.251+). Computed across the whole session and
+# scoped to the main conversation, so it tracks actual spend rather than the
+# last request's luck. Absent before the first API response of a session.
+if [ "$PC_PRESENT" = "1" ] && [ -n "$PC_HIT" ]; then
+  CACHE_HIT=$PC_HIT
+fi
+
+# === Helper: compact a cache-miss cause name ===
+compact_cause() {
+  case "${1%%,*}" in
+    tools_changed)         echo "tools" ;;
+    system_prompt_changed) echo "sysprompt" ;;
+    ttl_expired_5m)        echo "ttl5m" ;;
+    ttl_expired_1h)        echo "ttl1h" ;;
+    likely_server_side)    echo "server" ;;
+    *)                     echo "${1%%,*}" ;;
+  esac
+}
 
 # === API wait percentage ===
 API_WAIT_PCT=""
@@ -221,40 +338,41 @@ fi
 # ══════════════════════════════════════════════════════════════
 [ "$STATUSLINE_SHORT_MODEL" = "1" ] && MODEL="${MODEL// context/}"
 
-# Terminal width detection (priority, since CC's .terminal.width is often 0
-# and `tput cols` returns non-TTY default 80 — both lie):
-#   1. .terminal.width from JSON (authoritative if CC provides it)
-#   2. stty size </dev/tty (most reliable for actual pane width)
-#   3. tput cols (unreliable, only used if sane)
-#   4. $COLUMNS env (CC ≥ 2.1.153 always exports, may be 0 in non-TTY subprocs)
-#   5. Fallback 80
-ACTUAL_COLS=${TERM_W:-0}
+# Terminal width detection.
+#
+# Claude Code captures the script's stdout instead of wiring it to the terminal,
+# so width probes that go through stdout cannot see the real pane. CC sets
+# COLUMNS/LINES itself before each run and the docs name them as the source to
+# read, so $COLUMNS is authoritative.
+#
+# Two probes were removed after measuring a real 2.1.278 payload:
+#   - .terminal.width: no such field exists in the payload (confirmed against a
+#     live capture and the documented field list). `// 0` made it always 0, so
+#     it never won and every run fell through it.
+#   - tput cols: ncurses answers from $COLUMNS when it is in the env, so tput
+#     just echoes back what we already have — one fork for zero information.
+#     Without COLUMNS it would report the non-TTY default instead of the pane.
+# `stty size </dev/tty` bypasses the captured stdout and does work in some
+# terminals, but measured empty under CC, so it stays only as a fallback and is
+# probed lazily — the common path now forks no subprocess at all.
+ACTUAL_COLS=0
+if [ -n "$COLUMNS" ] && [ "$COLUMNS" -ge 10 ] && [ "$COLUMNS" -le 1000 ] 2>/dev/null; then
+  ACTUAL_COLS=$COLUMNS
+fi
 
-# Probe stty + tput once upfront — used by fallback chain and reused by debug log.
-# Wrap in { ... } 2>/dev/null so shell redirection errors from </dev/tty are swallowed
-# in headless/no-TTY environments (CI, Docker without -t) where /dev/tty is absent.
-STTY_COLS=$({ stty size </dev/tty 2>/dev/null; } 2>/dev/null | awk '{print $2}')
-TPUT_COLS=$(tput cols 2>/dev/null)
-
-if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
-  if [ -n "$STTY_COLS" ] && [ "$STTY_COLS" -ge 10 ] && [ "$STTY_COLS" -le 500 ] 2>/dev/null; then
+STTY_COLS=""
+STTY_PROBED=""
+if [ "$ACTUAL_COLS" = "0" ]; then
+  STTY_PROBED=1
+  # Wrap in { ... } 2>/dev/null so redirection errors from </dev/tty are swallowed
+  # in headless environments (CI, Docker without -t) where /dev/tty is absent.
+  STTY_COLS=$({ stty size </dev/tty 2>/dev/null; } 2>/dev/null | awk '{print $2}')
+  if [ -n "$STTY_COLS" ] && [ "$STTY_COLS" -ge 10 ] && [ "$STTY_COLS" -le 1000 ] 2>/dev/null; then
     ACTUAL_COLS=$STTY_COLS
   fi
 fi
 
-if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
-  if [ -n "$TPUT_COLS" ] && [ "$TPUT_COLS" -ge 10 ] 2>/dev/null; then
-    ACTUAL_COLS=$TPUT_COLS
-  fi
-fi
-
-if [ "$ACTUAL_COLS" = "0" ] || [ -z "$ACTUAL_COLS" ]; then
-  if [ -n "$COLUMNS" ] && [ "$COLUMNS" -gt 0 ] 2>/dev/null; then
-    ACTUAL_COLS=$COLUMNS
-  else
-    ACTUAL_COLS=80
-  fi
-fi
+[ "$ACTUAL_COLS" = "0" ] && ACTUAL_COLS=80
 
 # Soft cap via STATUSLINE_MAX_WIDTH (only when actual wider than cap)
 if [ -n "$STATUSLINE_MAX_WIDTH" ] && [ "$STATUSLINE_MAX_WIDTH" -gt 0 ] && [ "$ACTUAL_COLS" -gt "$STATUSLINE_MAX_WIDTH" ]; then
@@ -273,28 +391,110 @@ L1_BUDGET=$BUDGET
 # Diagnosis log (only when STATUSLINE_DEBUG=1) — uses cached probes, no extra subprocess
 if [ -n "$STATUSLINE_DEBUG" ]; then
   {
-    echo "$(date +%H:%M:%S) TERM_W=$TERM_W stty_cols=${STTY_COLS:-na} tput_cols=${TPUT_COLS:-na} COLUMNS=${COLUMNS:-unset} ACTUAL=$ACTUAL_COLS MAX=${STATUSLINE_MAX_WIDTH:-unset} PAD=$CHROME_PAD -> COLS=$COLS BUDGET=$BUDGET"
+    # STTY_PROBE distinguishes "COLUMNS won, stty never ran" from "stty ran and
+    # came back empty" — the previous label printed the same text for both.
+    _stty_state="notprobed"
+    [ -n "${STTY_PROBED:-}" ] && _stty_state="${STTY_COLS:-empty}"
+    echo "$(date +%H:%M:%S) stty=$_stty_state COLUMNS=${COLUMNS:-unset} ACTUAL=$ACTUAL_COLS MAX=${STATUSLINE_MAX_WIDTH:-unset} PAD=$CHROME_PAD -> COLS=$COLS BUDGET=$BUDGET"
   } >> /tmp/statusline-diag.log 2>/dev/null
 fi
 
-# Build L1 at a given degradation level (0=full, 4=most compact).
+# === CHROME_PAD calibration mode ===
+# CC renders the status line inside a padded box, so the usable width is narrower
+# than $COLUMNS by a fixed number of columns. That difference cannot be read from
+# the payload, so it has to be measured once per terminal setup.
+#
+# Usage:  touch ~/.claude/.statusline-ruler   → the status line becomes a ruler
+#         read off the last digit still visible, multiply by 10
+#         rm ~/.claude/.statusline-ruler      → back to normal
+if [ -f "$HOME/.claude/.statusline-ruler" ]; then
+  _rule=""
+  for ((_i = 1; _i <= ACTUAL_COLS; _i++)); do
+    if [ $((_i % 10)) -eq 0 ]; then _rule+="$(( (_i / 10) % 10 ))"; else _rule+="."; fi
+  done
+  echo "$_rule"
+  echo "COLUMNS=$ACTUAL_COLS · last visible digit above x10 = real usable width"
+  echo "current CHROME_PAD=$CHROME_PAD -> BUDGET=$BUDGET (set STATUSLINE_CHROME_PAD to change)"
+  echo "rm ~/.claude/.statusline-ruler to exit calibration"
+  exit 0
+fi
+
+# Build L1 at a given degradation level (0=full, 5=most compact).
 # Order: least lossy first — strip decorations before sacrificing signal.
 #   L1: Ctx label+suffix (pure decoration, no info loss)
 #   L2: Branch trunc 24→16 (mid-branch ellipsis, small loss)
-#   L3: Model compact (Opus 4.6 (1M) → O4.6·1M, medium loss)
-#   L4: Drop repo name (can be inferred from CWD, largest loss)
+#   L3: Effort abbreviated (xhigh → X, small loss)
+#   L4: Model compact (Opus 4.6 (1M) → O4.6·1M, medium loss)
+#   L5: Drop repo name (can be inferred from CWD, largest loss)
+# The 200k marker and the mode flags are never dropped — they are the only
+# signals on this line that the rest of the status line cannot imply.
 build_l1() {
   local level=$1
-  local m="$MODEL" bmax=24 show_repo=1 ctx_verbose=1
+  local m="$MODEL" bmax=24 show_repo=1 ctx_verbose=1 eff_full=1
   [ $level -ge 1 ] && ctx_verbose=0
   [ $level -ge 2 ] && bmax=16
-  [ $level -ge 3 ] && m=$(compact_model "$MODEL")
-  [ $level -ge 4 ] && show_repo=0
+  [ $level -ge 3 ] && eff_full=0
+  [ $level -ge 4 ] && m=$(compact_model "$MODEL")
+  [ $level -ge 5 ] && show_repo=0
 
-  local L
-  L=$(printf '[%s]' "$m")
-  [ $show_repo -eq 1 ] && [ -n "$REPO" ] && L="${L} $(trunc_repo "$REPO")"
-  [ -n "$BRANCH" ] && L="${L}${DIM}:$(trunc_branch "$BRANCH" "$bmax")${RST}"
+  # Model segment: name + effort + mode flags. A flag is rendered only when the
+  # state differs from the default, so an ordinary session spends no columns on
+  # them and an unusual one is impossible to miss.
+  local mseg="$m"
+  if [ -n "$EFFORT" ]; then
+    if [ $eff_full -eq 1 ]; then
+      mseg="${mseg}${DIM}·${EFFORT}${RST}"
+    else
+      mseg="${mseg}${DIM}·$(compact_effort "$EFFORT")${RST}"
+    fi
+  fi
+  [ "$FAST_MODE" = "true" ] && mseg="${mseg}${YLW}⚡${RST}"
+  # Abbreviated rather than dropped: thinking being off is an unusual state and
+  # is worth two columns even on a narrow pane. Left at full width it was the
+  # one segment with no rung to shrink it, which forced clamp_line — and that
+  # strips the colour off the entire line — at 40 and 41 columns.
+  if [ "$THINKING" = "false" ]; then
+    if [ $eff_full -eq 1 ]; then
+      mseg="${mseg}${DIM}·nothink${RST}"
+    else
+      mseg="${mseg}${DIM}·nt${RST}"
+    fi
+  fi
+
+  # Build repo and branch together so dropping the repo does not leave the
+  # branch's ":" separator dangling off the model segment ("[O5·X]:main").
+  local loc=""
+  [ $show_repo -eq 1 ] && [ -n "$REPO" ] && loc="$(trunc_repo "$REPO")"
+  if [ -n "$BRANCH" ]; then
+    if [ -n "$loc" ]; then
+      loc="${loc}${DIM}:$(trunc_branch "$BRANCH" "$bmax")${RST}"
+    else
+      loc="${DIM}$(trunc_branch "$BRANCH" "$bmax")${RST}"
+    fi
+  fi
+
+  local L="[${mseg}]"
+
+  # Position matters more than the ladder here. Appending this at the end of the
+  # line put it first in the firing line of clamp_line, which cuts from the right
+  # — so the marker disappeared exactly when the pane was tightest. Sitting right
+  # after the model segment it survives every truncation.
+  #
+  # NOT a pricing boundary: Claude 4.6 and later bill the whole 1M window at the
+  # standard rate ("a 900k-token request is billed at the same per-token rate as
+  # a 9k-token request"). It marks the long-context mode — what /usage attributes
+  # as the `long_context` behaviour when explaining where plan usage went. A mode
+  # indicator, not an alarm, and coloured as one. The percentage cannot reveal it
+  # on a 1M window: 220k reads as 22%.
+  if [ "$EXCEEDS_200K" = "true" ]; then
+    if [ $level -ge 6 ]; then
+      L="${L} ${YLW}!${RST}"
+    else
+      L="${L} ${YLW}200k+${RST}"
+    fi
+  fi
+
+  [ -n "$loc" ] && L="${L} ${loc}"
   if [ $ctx_verbose -eq 1 ]; then
     L="${L} │ Ctx: $(cpct "$CTX_PCT") $(bar "$CTX_PCT")/${CTX_LABEL}"
   else
@@ -304,7 +504,7 @@ build_l1() {
 }
 
 # Pick lowest degradation level that fits budget
-for _level in 0 1 2 3 4; do
+for _level in 0 1 2 3 4 5 6; do
   L1=$(build_l1 $_level)
   LEN=$(visible_len "$L1")
   [ "$LEN" -le "$L1_BUDGET" ] && break
@@ -321,8 +521,9 @@ COST_FMT=$(printf '$%.2f' "$COST")
 #   L0: full   L1: drop reset countdown / drop API duration
 #   L2: drop 7d (cloud only)   L3: only cost
 # ══════════════════════════════════════════════════════════════
-FIVE_INT=$(echo "$FIVE_H_PCT" | cut -d. -f1)
-SEVEN_INT=$(echo "$SEVEN_D_PCT" | cut -d. -f1)
+FIVE_INT=${FIVE_H_PCT%%.*}
+SEVEN_INT=${SEVEN_D_PCT%%.*}
+SPEND_INT=${SPEND_PCT%%.*}
 API_SEC=0
 TPS="?"
 if [ "$API_DURATION_MS" -gt 0 ]; then
@@ -333,21 +534,42 @@ fi
 build_l2() {
   local level=$1
   [ $level -ge 3 ] && { echo "$COST_FMT"; return; }
-  local L=""
-  if [ -n "$FIVE_H_PCT" ] && [ "$FIVE_H_PCT" != "null" ]; then
-    L="5h: $(cpct "$FIVE_INT")"
-    [ $level -lt 1 ] && L="${L} ⟳$(fmt_reset "$FIVE_H_RESET")"
-    if [ $level -lt 2 ]; then
-      L="${L} │ 7d: $(cpct "$SEVEN_INT")"
-      [ $level -lt 1 ] && L="${L} ⟳$(fmt_reset "$SEVEN_D_RESET")"
-    fi
+  local parts=() seg L=""
+
+  # Every window is independently optional, and Claude Code drops one once its
+  # resets_at has passed. Gating the whole block on five_hour discarded a
+  # seven_day figure that was already parsed — which is exactly the state after
+  # a 5-hour window rolls over, i.e. several times a day.
+  if [ -n "$FIVE_H_PCT" ]; then
+    seg="5h: $(cpct "$FIVE_INT")"
+    [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "$FIVE_H_RESET")"
+    parts+=("$seg")
+  fi
+  if [ -n "$SEVEN_D_PCT" ] && [ $level -lt 2 ]; then
+    seg="7d: $(cpct "$SEVEN_INT")"
+    [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "$SEVEN_D_RESET")"
+    parts+=("$seg")
+  fi
+  if [ -n "$SPEND_PCT" ] && [ $level -lt 2 ]; then
+    seg="spend: $(cpct "$SPEND_INT")"
+    [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "$SPEND_RESET")"
+    parts+=("$seg")
+  fi
+
+  if [ ${#parts[@]} -gt 0 ]; then
+    for seg in "${parts[@]}"; do
+      if [ -n "$L" ]; then L="${L} │ ${seg}"; else L="$seg"; fi
+    done
+  elif [ "$API_DURATION_MS" -gt 0 ]; then
+    # Responses have arrived, but no plan window came with them: an API key, a
+    # cloud provider, or an account without the usage scope. Such a session has
+    # no limits to show at all, so showing throughput beats a "waiting" that
+    # would never resolve.
+    L="Speed: ${CYN}${TPS} tok/s${RST}"
+    [ $level -lt 1 ] && L="${L} │ API: $(fmt_dur "$API_DURATION_MS")"
   else
-    if [ "$API_DURATION_MS" -gt 0 ]; then
-      L="Speed: ${CYN}${TPS} tok/s${RST}"
-      [ $level -lt 1 ] && L="${L} │ API: $(fmt_dur "$API_DURATION_MS")"
-    else
-      L="Speed: waiting..."
-    fi
+    # No responses yet either — genuinely too early to know which case this is.
+    L="${DIM}limits: waiting${RST}"
   fi
   echo "${L} │ ${COST_FMT}"
 }
@@ -367,17 +589,55 @@ L2=$(clamp_line "$L2" "$BUDGET")
 build_l3() {
   local level=$1
   local L=""
-  if [ $level -lt 3 ]; then
+  if [ $level -lt 4 ]; then
     L="${DIM}in:${RST}${CYN}$(fmt_tok "$TOTAL_IN")${RST} ${DIM}out:${RST}${MAG}$(fmt_tok "$TOTAL_OUT")${RST}"
   fi
-  local cache_seg="Cache: ${CACHE_HIT}% hit"
-  [ $level -lt 2 ] && cache_seg="${cache_seg} ${DIM}(r:$(fmt_tok "$CACHE_READ") w:$(fmt_tok "$CACHE_CREATE"))${RST}"
+
+  local cache_seg="Cache: ${CACHE_HIT}%"
+  if [ "$PC_PRESENT" = "1" ]; then
+    if [ "$PC_OBSERVED" != "true" ]; then
+      cache_seg="Cache: ${DIM}not reported${RST}"
+    elif [ "$PC_WARM" = "true" ]; then
+      # A 5m TTL on a subscription means the session is drawing on usage credits
+      # (the subscription TTL is 1h). It silently multiplies re-cache cost, so it
+      # gets a colour rather than being one more dim token.
+      local ttl_c="$GRN"
+      [ "$PC_TTL" = "5m" ] && ttl_c="$RED"
+      cache_seg="${cache_seg} ${ttl_c}${PC_TTL}${RST}"
+      [ $level -lt 3 ] && [ -n "$PC_EXPIRES" ] && \
+        cache_seg="${cache_seg}${DIM}⟳$(fmt_reset "$PC_EXPIRES")${RST}"
+    else
+      cache_seg="${cache_seg} ${RED}COLD${RST}"
+    fi
+  else
+    cache_seg="${cache_seg} hit"
+    [ $level -lt 2 ] && cache_seg="${cache_seg} ${DIM}(r:$(fmt_tok "$CACHE_READ") w:$(fmt_tok "$CACHE_CREATE"))${RST}"
+  fi
   if [ -n "$L" ]; then L="${L} │ ${cache_seg}"; else L="$cache_seg"; fi
+
+  # Misses and their diagnosed cause. Shown only when non-zero: a healthy session
+  # says nothing, so anything here is worth reading.
+  if [ "$PC_PRESENT" = "1" ] && [ $level -lt 3 ]; then
+    if [ "$PC_MISSES" != "0" ]; then
+      local ms="${YLW}miss:${PC_MISSES}${RST}"
+      [ -n "$PC_CAUSE" ] && ms="${ms}${DIM}($(compact_cause "$PC_CAUSE"))${RST}"
+      L="${L} │ ${ms}"
+    fi
+    [ "$PC_REBUILDS" != "0" ] && L="${L} ${DIM}rb:${PC_REBUILDS}${RST}"
+  fi
+
+  # What the next request re-caches if the cache goes cold first — the size of
+  # the bill for walking away from the terminal.
+  if [ "$PC_PRESENT" = "1" ] && [ $level -lt 2 ] && \
+     [ -n "$PC_RECACHE" ] && [ "$PC_RECACHE" != "0" ]; then
+    L="${L} │ ${DIM}cold:$(fmt_tok "$PC_RECACHE")${RST}"
+  fi
+
   [ $level -lt 1 ] && [ -n "$API_WAIT_PCT" ] && L="${L} │ ${DIM}API${RST} ${API_WAIT_PCT}"
   echo "$L"
 }
 
-for _lvl in 0 1 2 3; do
+for _lvl in 0 1 2 3 4; do
   L3=$(build_l3 $_lvl)
   [ "$(visible_len "$L3")" -le "$BUDGET" ] && break
 done
@@ -404,7 +664,30 @@ build_l4() {
     parts+=("${GRN}+${LINES_ADD}${RST}/${RED}-${LINES_DEL}${RST}")
   fi
   [ -n "$GIT_STATS" ] && parts+=("$GIT_STATS")
-  [ $show_wt -eq 1 ] && [ -n "$WORKTREE_NAME" ] && parts+=("${CYN}🌿${WORKTREE_NAME}${RST}${DIM}:${WORKTREE_BRANCH}${RST}")
+
+  # Open PR / MR for this branch. Never dropped: it is the only place the status
+  # line can say the branch is already approved or already has changes requested.
+  if [ -n "$PR_NUM" ]; then
+    local pr_sigil="#"
+    [ "$PR_KIND" = "mr" ] && pr_sigil="!"
+    local pr_seg="${pr_sigil}${PR_NUM}"
+    case "$PR_STATE" in
+      approved)          pr_seg="${GRN}${pr_seg}✓${RST}" ;;
+      changes_requested) pr_seg="${RED}${pr_seg}✗${RST}" ;;
+      draft)             pr_seg="${DIM}${pr_seg}·draft${RST}" ;;
+      *)                 pr_seg="${YLW}${pr_seg}${RST}" ;;
+    esac
+    parts+=("$pr_seg")
+  fi
+
+  if [ $show_wt -eq 1 ]; then
+    if [ -n "$WORKTREE_NAME" ]; then
+      parts+=("${CYN}🌿${WORKTREE_NAME}${RST}${DIM}:${WORKTREE_BRANCH}${RST}")
+    elif [ -n "$GIT_WORKTREE" ]; then
+      # Any linked git worktree, not just a CC worktree session.
+      parts+=("${CYN}🌿${GIT_WORKTREE}${RST}")
+    fi
+  fi
   [ $show_agent -eq 1 ] && [ -n "$AGENT" ] && parts+=("${MAG}${AGENT}${RST}")
   [ $show_ver -eq 1 ] && [ -n "$VERSION" ] && parts+=("${DIM}v${VERSION}${RST}")
 
@@ -424,7 +707,6 @@ done
 L4=$(clamp_line "$L4" "$BUDGET")
 
 # === Output ===
-echo -e "$L1"
-echo -e "$L2"
-echo -e "$L3"
-echo -e "$L4"
+# printf '%s\n', never `echo -e`: the lines carry payload-supplied strings and
+# %s expands nothing in them. See the note on the colour definitions.
+printf '%s\n' "$L1" "$L2" "$L3" "$L4"
