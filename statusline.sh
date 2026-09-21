@@ -267,23 +267,34 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
     touch "$GIT_LOCK" 2>/dev/null
     GIT_M=$(git diff --name-only 2>/dev/null | wc -l | tr -d ' ')
     GIT_A=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
+    # Commits that exist only on this machine. Purely local — it compares two
+    # local refs and needs no network, so it is always accurate.
+    #
+    # Deliberately NOT paired with "behind": origin/* only moves on fetch, pull
+    # or push, so a behind count reports the state at the last fetch, not the
+    # state now. Displayed permanently it would read as an all-clear the script
+    # cannot actually give, and would invite skipping the `git fetch` that the
+    # shared-file workflow depends on. Missing information beats false comfort.
+    GIT_AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
     # Cache the NUMBERS, never the rendered string. A cache holding rendered
     # output outlives the code that rendered it: when the colour constants moved
     # from the literal "\033" to real ESC bytes, entries written by the previous
     # version were printed verbatim as `\033[33m1M\033[0m` and measured as seven
     # visible characters each, which pushed line 4 over budget and silently
     # dropped the version segment.
-    echo "$GIT_M $GIT_A" > "$GIT_CACHE"
+    echo "$GIT_M $GIT_A $GIT_AHEAD" > "$GIT_CACHE"
     rm -f "$GIT_LOCK" 2>/dev/null
   fi
 
-  _gm=""; _ga=""
+  _gm=""; _ga=""; _gahead=""
   if [ -f "$GIT_CACHE" ]; then
-    read -r _gm _ga < "$GIT_CACHE" 2>/dev/null
-    # Reject anything that is not two integers — that is an entry written by the
+    # A two-field entry is one written before the ahead count existed; the third
+    # variable simply stays empty and the segment is skipped.
+    read -r _gm _ga _gahead < "$GIT_CACHE" 2>/dev/null
+    # Reject anything that is not integers — that is an entry written by the
     # pre-change version, in the rendered-string format.
-    case "${_gm}:${_ga}" in
-      *[!0-9:]*) _gm=""; _ga="" ;;
+    case "${_gm}:${_ga}:${_gahead}" in
+      *[!0-9:]*) _gm=""; _ga=""; _gahead="" ;;
     esac
   fi
   if [ -n "$_gm" ] && [ "$_gm" -gt 0 ] 2>/dev/null; then
@@ -292,6 +303,12 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
   if [ -n "$_ga" ] && [ "$_ga" -gt 0 ] 2>/dev/null; then
     [ -n "$GIT_STATS" ] && GIT_STATS="${GIT_STATS} "
     GIT_STATS="${GIT_STATS}${GRN}${_ga}A${RST}"
+  fi
+  # Shown only when non-zero, and absent entirely without an upstream — a repo
+  # with no remote at all is a different problem, tracked elsewhere.
+  if [ -n "$_gahead" ] && [ "$_gahead" -gt 0 ] 2>/dev/null; then
+    [ -n "$GIT_STATS" ] && GIT_STATS="${GIT_STATS} "
+    GIT_STATS="${GIT_STATS}${YLW}↑${_gahead}${RST}"
   fi
 fi
 

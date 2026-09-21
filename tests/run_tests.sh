@@ -171,7 +171,9 @@ else
   echo "  *** FAIL  控制組失敗 — 下面的案例測不到東西"; FAIL=$((FAIL+1))
 fi
 
-for c in '\033[33m5M\033[0m \033[32m2A\033[0m' 'garbage' '5 2 3' '-1 2' ''; do
+# NB: '5 2 3' is no longer listed here — a third field is the valid ahead count
+# since R12, and leaving it labelled "壞快取" would mislead the next reader.
+for c in '\033[33m5M\033[0m \033[32m2A\033[0m' 'garbage' '5 2 3 4' '-1 2' '' '5.5 2'; do
   out=$(printf '%s\n' "$c" | tee "$GIT_CACHE_PATH" >/dev/null; render "$BASE" 132)
   n=$(printf '%s' "$out" | grep -c '')
   esc=$(printf '%s' "$out" | grep -c '033\[' || true)
@@ -183,7 +185,33 @@ for c in '\033[33m5M\033[0m \033[32m2A\033[0m' 'garbage' '5 2 3' '-1 2' ''; do
 done
 if [[ "$(_cache_l4 '7 3')" == *"7M 3A"* ]]; then echo "  PASS  正常快取 '7 3' → 7M 3A"
 else echo "  *** FAIL  正常快取沒渲染出來"; FAIL=$((FAIL+1)); fi
-printf '1 1\n' | tee "$GIT_CACHE_PATH" >/dev/null
+
+echo "### R12: unpushed commit 數（ahead）###"
+# Two-field entries predate the ahead count; they must degrade to "no arrow",
+# not to a broken field.
+if [[ "$(_cache_l4 '7 3')" != *"↑"* ]]; then echo "  PASS  舊兩欄快取 → 不顯示箭頭"
+else echo "  *** FAIL  舊兩欄快取誤顯示箭頭"; FAIL=$((FAIL+1)); fi
+if [[ "$(_cache_l4 '7 3 0')" != *"↑"* ]]; then echo "  PASS  ahead=0 → 不顯示"
+else echo "  *** FAIL  ahead=0 仍顯示"; FAIL=$((FAIL+1)); fi
+out=$(_cache_l4 '7 3 2')
+if [[ "$out" == *"↑2"* ]]; then echo "  PASS  ahead=2 → $out"
+else echo "  *** FAIL  ahead=2 沒顯示：$out"; FAIL=$((FAIL+1)); fi
+if [[ "$(_cache_l4 '0 0 5')" == *"↑5"* ]]; then echo "  PASS  只有 ahead（乾淨工作區）→ 仍顯示"
+else echo "  *** FAIL  只有 ahead 時沒顯示"; FAIL=$((FAIL+1)); fi
+for c in '7 3 garbage' '7 3 -1' '7 3 2 9'; do
+  o=$(printf '%s\n' "$c" | tee "$GIT_CACHE_PATH" >/dev/null; render "$BASE" 132)
+  n=$(printf '%s' "$o" | grep -c '')
+  if [ "$n" = "4" ]; then echo "  PASS  壞 ahead 欄 '$c' → 仍 4 行"
+  else echo "  *** FAIL  壞 ahead 欄 '$c' → $n 行"; FAIL=$((FAIL+1)); fi
+done
+# The arrow must be counted as one display column, like the other box glyphs.
+out=$(printf '7 3 12\n' | tee "$GIT_CACHE_PATH" >/dev/null; render "$BASE" 132)
+if printf '%s\n' "$out" | python3 "$DIR/width_oracle.py" 127 -q; then
+  echo "  PASS  含箭頭時寬度計算正確"
+else
+  echo "  *** FAIL  含箭頭時寬度算錯"; FAIL=$((FAIL+1))
+fi
+printf '1 1 0\n' | tee "$GIT_CACHE_PATH" >/dev/null
 
 echo "############ 使用者真實設定 ############"
 echo "### STATUSLINE_MAX_WIDTH=75 + SHORT_MODEL=1（settings.json 實際值） ###"
