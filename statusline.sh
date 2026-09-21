@@ -275,7 +275,9 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
     # state now. Displayed permanently it would read as an all-clear the script
     # cannot actually give, and would invite skipping the `git fetch` that the
     # shared-file workflow depends on. Missing information beats false comfort.
-    GIT_AHEAD=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
+    # '@{u}..HEAD' is quoted: unquoted, the braces read as a brace expansion to
+    # both the shell's eye and shellcheck's (SC1083).
+    GIT_AHEAD=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
     # Cache the NUMBERS, never the rendered string. A cache holding rendered
     # output outlives the code that rendered it: when the colour constants moved
     # from the literal "\033" to real ESC bytes, entries written by the previous

@@ -27,7 +27,7 @@ REPO_CWD="${STATUSLINE_TEST_CWD:-$DIR/..}"
 # fills its budget fail by exactly that difference — which is what happened the
 # day the user's settings.json changed the value from 5 to 4.
 render() (
-  cd "$REPO_CWD" 2>/dev/null || cd "$DIR"
+  cd "$REPO_CWD" 2>/dev/null || cd "$DIR" || exit 1
   unset STATUSLINE_MAX_WIDTH STATUSLINE_SHORT_MODEL STATUSLINE_DEBUG
   STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
 )
@@ -35,7 +35,7 @@ render() (
 mut() { jq -c "$1" "$REAL"; }
 
 assert() {
-  local name=$1 out=$2 budget=$3 quiet=${4:-}
+  local name=$1 out=$2 budget=$3
   local n bad=0
   n=$(printf '%s' "$out" | grep -c '' )
   if [ "$n" != "4" ]; then
@@ -220,7 +220,7 @@ printf '1 1 0\n' | tee "$GIT_CACHE_PATH" >/dev/null
 
 echo "############ 使用者真實設定 ############"
 echo "### STATUSLINE_MAX_WIDTH=75 + SHORT_MODEL=1（settings.json 實際值） ###"
-out=$( cd "$REPO_CWD"; COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
+out=$( cd "$REPO_CWD" || exit 1; COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
 printf '%s\n' "$out"
 assert "user real settings" "$out" 70
 
