@@ -123,6 +123,37 @@ out=$(render "$(mut '.rate_limits.spend_limit = {used_percentage:88,resets_at:17
 l2=$(printf '%s\n' "$out" | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g')
 if [[ "$l2" == *"spend:"* ]]; then echo "  PASS  $l2"; else echo "  *** FAIL  spend_limit 沒顯示: $l2"; FAIL=$((FAIL+1)); fi
 
+echo "### R13: 只有一個時窗（Ultra 自 2026-10-31 只送 7d）時，任何寬度都不得把它丟掉 ###"
+# The L2 rung drops 7d and spend, which reads as if a single-window plan would lose
+# its only limit and fall through to the tok/s line meant for sessions without plan
+# limits. It does not today — one window's L1 line is short enough to fit wherever
+# L2 would — so this pins that down rather than a past bug. Checked against the
+# two-window payload instead of hard-coded widths: wherever that one still shows a
+# window, the 7d-only plan must show its own.
+_l2() { render "$1" "$2" | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g'; }
+SEVEN_ONLY=$(mut 'del(.rate_limits.five_hour)')
+SPEND_ONLY=$(mut '.rate_limits = {spend_limit:{used_percentage:88,resets_at:1790301600}}')
+l2_rung=0 bad=0
+for ((w = 20; w <= 200; w++)); do
+  ref=$(_l2 "$BASE" "$w")
+  [[ "$ref" == *"5h:"* && "$ref" != *"7d:"* ]] && l2_rung=$((l2_rung + 1))
+  seven=$(_l2 "$SEVEN_ONLY" "$w")
+  spend=$(_l2 "$SPEND_ONLY" "$w")
+  if [[ "$ref" == *"5h:"* && "$seven" != *"7d:"* ]]; then
+    echo "  *** FAIL  7d-only @ COLUMNS=$w → ${seven}（兩時窗版仍顯示：${ref}）"; bad=1; break
+  fi
+  case "$seven$spend" in
+    *"tok/s"*|*"waiting"*) echo "  *** FAIL  有時窗卻退回無限額畫面 @ COLUMNS=$w → $seven ／ $spend"; bad=1; break ;;
+  esac
+done
+if [ "$l2_rung" -eq 0 ]; then
+  echo "  *** FAIL  控制組：20..200 欄沒有任何寬度落在 L2，這個案例測不到東西"; FAIL=$((FAIL+1))
+elif [ "$bad" = 0 ]; then
+  echo "  PASS  20..200 欄單一時窗都保留（其中 $l2_rung 個寬度落在 L2）"
+else
+  FAIL=$((FAIL+1))
+fi
+
 echo "### R6: payload 字串含 backslash 必須仍是 4 行 ###"
 for v in 'aa\nbb' 'aa\cbb' 'aa\tbb' 'aa\\bb'; do
   out=$(render "$(jq -c --arg v "$v" '.workspace.git_worktree = $v' "$REAL")" 132)
