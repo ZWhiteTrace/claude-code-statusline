@@ -26,10 +26,14 @@ REPO_CWD="${STATUSLINE_TEST_CWD:-$DIR/..}"
 # different STATUSLINE_CHROME_PAD from the environment makes every case that
 # fills its budget fail by exactly that difference — which is what happened the
 # day the user's settings.json changed the value from 5 to 4.
+# The per-model limits come from a file, not the payload. Unpinned, every case
+# would read this machine's real ~/.claude.json and change with the live usage.
+# USAGE_FILE_UNDER_TEST selects a fixture; by default no file exists.
 render() (
   cd "$REPO_CWD" 2>/dev/null || cd "$DIR" || exit 1
   unset STATUSLINE_MAX_WIDTH STATUSLINE_SHORT_MODEL STATUSLINE_DEBUG
-  STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
+  STATUSLINE_USAGE_FILE="${USAGE_FILE_UNDER_TEST:-$DIR/no-such-usage-file}" \
+    STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
 )
 
 mut() { jq -c "$1" "$REAL"; }
@@ -249,9 +253,118 @@ else
 fi
 printf '1 1 0\n' | tee "$GIT_CACHE_PATH" >/dev/null
 
+echo "############ 每個模型的週額度與加購額度（讀 ~/.claude.json 的用量快取） ############"
+# Times in the fixture are relative to now, so the age and reset checks see the
+# same thing on every run. fixture-usage.json is synthetic: fake account id, no
+# real usage figures.
+USAGE_TMP=$(mktemp -d)
+trap 'rm -rf "$USAGE_TMP"' EXIT
+usage() {  # usage <file name> [jq mutation applied after the times are set]
+  local now; now=$(date +%s)
+  jq --argjson now "$now" '
+    .cachedUsageUtilization.fetchedAtMs = (($now - 60) * 1000)
+    | .cachedUsageUtilization.utilization.limits[].resets_at = ((($now + 43200) | todate) | sub("Z$"; ".141149+00:00"))
+    | '"${2:-.}" "$DIR/fixture-usage.json" > "$USAGE_TMP/$1"
+  printf '%s' "$USAGE_TMP/$1"
+}
+_ul2() { ( USAGE_FILE_UNDER_TEST=$1; render "$2" "${3:-132}" ) | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g'; }
+_ucheck() {  # _ucheck <name> <file> <expected substring, or !substring that must be absent>...
+  local name=$1 file=$2 l2 want ok=1; shift 2
+  l2=$(_ul2 "$file" "$BASE")
+  for want in "$@"; do
+    if [[ "$want" == "!"* ]]; then [[ "$l2" == *"${want#!}"* ]] && ok=0
+    else [[ "$l2" == *"$want"* ]] || ok=0; fi
+  done
+  if [ $ok = 1 ]; then echo "  PASS  $name: $l2"; else echo "  *** FAIL  $name: ${l2}（期望 $*）"; FAIL=$((FAIL+1)); fi
+}
+
+echo "### U1: 控制組 —— fixture 確實被讀到（下面的負向案例才有意義） ###"
+# "!scoped" catches the overall weekly_all entry leaking in as a per-model one.
+_ucheck "Fable 100% 與倒數" "$(usage base.json)" "fable: 100% ⟳1" "7d: 41%" "!scoped" "!41% ⟳1"
+_ucheck "不給檔案 → 與改版前相同" "$DIR/no-such-usage-file" "!fable" "!credits" "5h: 23%" "7d: 41%"
+
+echo "### U2: 加購額度只在用了、或有時窗滿了時出現 ###"
+_ucheck "Fable 滿、已用 0 → 顯示" "$(usage full-unused.json)" "credits: \$0.00/\$10 │"
+_ucheck "已用 \$1.23 → 顯示" "$(usage used.json '.cachedUsageUtilization.utilization.limits[1].percent = 40 | .cachedUsageUtilization.utilization.spend.used.amount_minor = 123')" "fable: 40%" "credits: \$1.23/\$10 │"
+_ucheck "沒滿也沒用 → 不顯示" "$(usage idle.json '.cachedUsageUtilization.utilization.limits[1].percent = 40')" "fable: 40%" "!credits"
+_ucheck "加購關閉 → 不顯示" "$(usage off.json '.cachedUsageUtilization.utilization.spend.enabled = false')" "fable: 100%" "!credits"
+_ucheck "非美元 → 幣別代碼" "$(usage eur.json '.cachedUsageUtilization.utilization.spend.used = {amount_minor:5,currency:"EUR",exponent:2}')" "credits: EUR 0.05/EUR 10 │"
+_ucheck "上限非整數" "$(usage odd.json '.cachedUsageUtilization.utilization.spend.limit.amount_minor = 1050')" "/\$10.50 │"
+out=$(_ul2 "$(usage seven-full.json 'del(.cachedUsageUtilization.utilization.limits[1])')" "$(mut '.rate_limits.seven_day.used_percentage = 100')")
+if [[ "$out" == *"credits: \$0.00/\$10 │"* && "$out" != *"fable"* ]]; then echo "  PASS  沒有 Fable 桶、payload 的 7d=100 也觸發: $out"
+else echo "  *** FAIL  payload 的 7d=100 沒觸發: $out"; FAIL=$((FAIL+1)); fi
+_ucheck "沒有 Fable 桶、7d 未滿 → 不顯示" "$(usage seven-ok.json 'del(.cachedUsageUtilization.utilization.limits[1])')" "!fable" "!credits"
+
+echo "### U3: 過時與過期 ###"
+_ucheck "11 分鐘前 → 還不標（背景每 15 分鐘更新）" "$(usage recent.json '.cachedUsageUtilization.fetchedAtMs -= 600000')" "fable: 100%" "!m)"
+_ucheck "21 分鐘前 → 標年齡" "$(usage stale.json '.cachedUsageUtilization.fetchedAtMs -= 1200000')" "fable: 100%" "(21m)"
+_ucheck "剛抓 → 不標年齡" "$(usage fresh.json)" "!m)"
+# A fixed weekly window only rises, so an old figure is a floor: kept, with its age.
+_ucheck "3 小時前 → 仍顯示並標 (3h)" "$(usage old.json '.cachedUsageUtilization.fetchedAtMs -= 10800000')" "fable: 100% ⟳" "credits: \$0.00/\$10 (3h)"
+# Credits count per month and carry no reset time: dropped after a day.
+_ucheck "超過 1 天 → 加購不顯示、Fable 仍在 (1d)" "$(usage day.json '.cachedUsageUtilization.fetchedAtMs -= 86400000')" "fable: 100% ⟳" "(1d)" "!credits"
+_ucheck "抓取時間在未來 → 不顯示" "$(usage future.json '.cachedUsageUtilization.fetchedAtMs += 600000')" "!fable"
+_ucheck "重置時間已過 → 該項不顯示" "$(usage reset.json '.cachedUsageUtilization.utilization.limits[1].resets_at = "2020-01-01T00:00:00.000000+00:00"')" "!fable"
+_ucheck "重置時間格式不明 → 顯示但不倒數" "$(usage noreset.json '.cachedUsageUtilization.utilization.limits[1].resets_at = "soon"')" "fable: 100%" "!fable: 100% ⟳"
+out=$(_ul2 "$(usage stale-narrow.json '.cachedUsageUtilization.fetchedAtMs -= 1200000')" "$BASE" 60)
+if [[ "$out" == *"fable: 100% (21m)"* ]]; then echo "  PASS  窄寬度仍保留年齡: $out"; else echo "  *** FAIL  窄寬度丟了年齡: $out"; FAIL=$((FAIL+1)); fi
+
+echo "### U4: 帳號 ###"
+_ucheck "帳號不同 → 不顯示" "$(usage other-account.json '.oauthAccount.accountUuid = "00000000-0000-4000-8000-000000000002"')" "!fable" "!credits"
+_ucheck "快取沒帶帳號 → 不顯示" "$(usage no-account.json 'del(.cachedUsageUtilization.accountUuid)')" "!fable"
+_ucheck "已登出（無 oauthAccount） → 不顯示" "$(usage logged-out.json 'del(.oauthAccount)')" "!fable"
+
+echo "### U5: 格式異常一律不得弄壞 statusline ###"
+printf 'not json' > "$USAGE_TMP/garbage.json"
+for f in "$USAGE_TMP/garbage.json" \
+         "$(usage limits-string.json '.cachedUsageUtilization.utilization.limits = "x"')" \
+         "$(usage pct-string.json '.cachedUsageUtilization.utilization.limits[1].percent = "100"')" \
+         "$(usage util-array.json '.cachedUsageUtilization.utilization = []')" \
+         "$(usage cache-string.json '.cachedUsageUtilization = "x"')" \
+         "$(usage spend-string.json '.cachedUsageUtilization.utilization.spend = "x"')" \
+         "$(usage exp-huge.json '.cachedUsageUtilization.utilization.spend.used.exponent = 40')" \
+         "$(usage root-array.json '[.]')"; do
+  out=$( USAGE_FILE_UNDER_TEST=$f; render "$BASE" 132 )
+  n=$(printf '%s' "$out" | grep -c '')
+  l2=$(printf '%s\n' "$out" | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g')
+  if [ "$n" = "4" ] && [[ "$l2" == *"7d: 41%"* ]] && ! printf '%s' "$out" | grep -q "jq error"; then
+    echo "  PASS  $(basename "$f") → 4 行、原本的時窗還在: $l2"
+  else
+    echo "  *** FAIL  $(basename "$f") → $n 行: $l2"; FAIL=$((FAIL+1))
+  fi
+done
+_ucheck "scope 為 null 的桶仍顯示（名稱退為 scoped）" "$(usage scope-null.json '.cachedUsageUtilization.utilization.limits[1].scope = null')" "scoped: 100%"
+_ucheck "名稱只留安全字元" "$(usage weird-name.json '.cachedUsageUtilization.utilization.limits[1].scope.model.display_name = "Fa;ble $(id) 5\u001b[31m"')" "fableid531m: 100%" '!$(' "!;"
+_ucheck "負的百分比 → 0" "$(usage negative.json '.cachedUsageUtilization.utilization.limits[1].percent = -5')" "fable: 0%"
+_ucheck "兩個模型桶都顯示" "$(usage two.json '.cachedUsageUtilization.utilization.limits += [.cachedUsageUtilization.utilization.limits[1] | .percent = 30 | .scope.model.display_name = "Opus"]')" "fable: 100%" "opus: 30%"
+
+echo "### U6: 寬度契約（有用量檔時） ###"
+# Not in a subshell: sweep adds to FAIL, and a subshell would throw the count away.
+USAGE_FILE_UNDER_TEST=$(usage sweep-base.json)
+sweep "usage: fable full + credits" "$BASE" 20 200
+USAGE_FILE_UNDER_TEST=$(usage sweep-all.json '.cachedUsageUtilization.fetchedAtMs -= 1500000 | .cachedUsageUtilization.utilization.spend.used.amount_minor = 98765')
+sweep "usage: 所有段落＋年齡" "$(mut '.rate_limits.spend_limit = {used_percentage:88,resets_at:1790301600}')" 20 200
+unset USAGE_FILE_UNDER_TEST
+
+echo "### U7: 只有 7d 的方案＋Fable 桶：任何寬度都不得退回無限額畫面，有時窗就有 Fable ###"
+SEVEN_ONLY_U=$(mut 'del(.rate_limits.five_hour)')
+U7_FILE=$(usage u7.json)
+bad=0 seen_l2=0
+for ((w = 20; w <= 200; w++)); do
+  l2=$(_ul2 "$U7_FILE" "$SEVEN_ONLY_U" "$w")
+  case "$l2" in *"tok/s"*|*"waiting"*) echo "  *** FAIL  @ COLUMNS=$w 退回無限額畫面 → $l2"; bad=1; break ;; esac
+  if [[ "$l2" == *"7d:"* && "$l2" != *"fable:"* ]]; then
+    echo "  *** FAIL  @ COLUMNS=$w 有 7d 卻沒有 Fable → $l2"; bad=1; break
+  fi
+  [[ "$l2" == *"fable:"* && "$l2" != *"7d:"* ]] && seen_l2=$((seen_l2 + 1))
+done
+if [ "$seen_l2" -eq 0 ]; then echo "  *** FAIL  控制組：沒有任何寬度落在 L2（7d 被丟、Fable 保留）"; FAIL=$((FAIL+1))
+elif [ "$bad" = 0 ]; then echo "  PASS  20..200 欄都保留 Fable（其中 $seen_l2 個寬度落在 L2）"
+else FAIL=$((FAIL+1)); fi
+
 echo "############ 使用者真實設定 ############"
 echo "### STATUSLINE_MAX_WIDTH=75 + SHORT_MODEL=1（settings.json 實際值） ###"
-out=$( cd "$REPO_CWD" || exit 1; COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
+out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
 printf '%s\n' "$out"
 assert "user real settings" "$out" 70
 

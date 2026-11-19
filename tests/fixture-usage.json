@@ -1,0 +1,49 @@
+{
+  "oauthAccount": {
+    "accountUuid": "00000000-0000-4000-8000-000000000001"
+  },
+  "cachedUsageUtilization": {
+    "fetchedAtMs": 0,
+    "accountUuid": "00000000-0000-4000-8000-000000000001",
+    "utilization": {
+      "five_hour": null,
+      "seven_day": {
+        "utilization": 41,
+        "resets_at": "2026-01-01T00:00:00.000000+00:00"
+      },
+      "limits": [
+        {
+          "kind": "weekly_all",
+          "group": "weekly",
+          "percent": 41,
+          "severity": "normal",
+          "resets_at": "",
+          "scope": null,
+          "is_active": false
+        },
+        {
+          "kind": "weekly_scoped",
+          "group": "weekly",
+          "percent": 100,
+          "severity": "critical",
+          "resets_at": "",
+          "scope": {
+            "model": { "id": null, "display_name": "Fable" },
+            "surface": null
+          },
+          "is_active": true
+        }
+      ],
+      "spend": {
+        "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+        "limit": { "amount_minor": 1000, "currency": "USD", "exponent": 2 },
+        "percent": 0,
+        "severity": "normal",
+        "enabled": true
+      },
+      "weekly_scoped_shares": [
+        { "limit_index": 1, "used_percent_of_weekly": 50, "allowance_percent_of_weekly": 50 }
+      ]
+    }
+  }
+}

@@ -565,11 +565,128 @@ L1=$(clamp_line "$L1" "$L1_BUDGET")
 COST_FMT=$(printf '$%.2f' "$COST")
 [ "$COST" = "0" ] || [ "$COST" = "0.0" ] && COST_FMT="${GRN}\$0.00${RST}"
 
+# === Per-model weekly limits and usage credits (not in the payload) ===
+# The payload's rate_limits carries five_hour / seven_day / spend_limit only. A
+# plan with a per-model weekly allowance (Fable on Max/Ultra, 2026-11) has a second
+# weekly limit the payload never mentions: the overall 7d can read well under 100%
+# while Fable's own allowance is used up and further Fable requests draw on credits.
+# Claude Code keeps the /api/oauth/usage response it fetches in ~/.claude.json as
+# cachedUsageUtilization. That is an undocumented internal cache, hence:
+#   - any failure (no file, another shape, a jq error) shows nothing extra
+#   - the cached account must be the signed-in one, as Claude Code requires
+#   - an entry whose resets_at has passed is dropped, like the payload's windows
+#   - past USAGE_STALE_AFTER the age is shown, so a figure that stopped updating
+#     cannot pass for a live one
+# Claude Code only refetches this when something asks for usage — /usage, the
+# model picker, an SDK get_usage — not on a timer (measured on 2.1.328: one write
+# in 40 idle minutes, and that one was a manual `claude -p /usage`). It also stops
+# trusting the cache after an hour for its own decisions. That cutoff is not
+# copied here: these windows are fixed weeks, so within one the percentage only
+# rises and an old figure is a floor, not an all-clear. It stays, with its age,
+# until its window resets. Credits carry no reset time and count per month, so
+# those are dropped after USAGE_CREDIT_MAX_AGE instead.
+# Running `claude -p /usage` on a schedule keeps it fresh; it calls no model.
+# skipped: CLAUDE_CONFIG_DIR (moves the file), add when someone uses it —
+# STATUSLINE_USAGE_FILE points the script at another path meanwhile.
+USAGE_FILE="${STATUSLINE_USAGE_FILE:-$HOME/.claude.json}"
+USAGE_STALE_AFTER=1200
+USAGE_CREDIT_MAX_AGE=86400
+USAGE_AGE="" SCOPED="" CREDIT_USED="" CREDIT_LIMIT="" CREDIT_EXP="" CREDIT_CUR=""
+if [ -f "$USAGE_FILE" ]; then
+  USAGE_OUT=$(jq -r --argjson now "$(date +%s)" --argjson credit_max_age "$USAGE_CREDIT_MAX_AGE" '
+    def epoch: if type == "string"
+      then (sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)$"; "Z") | try fromdateiso8601 catch null)
+      else null end;
+    def obj: if type == "object" then . else {} end;
+    def int: if type == "number" then floor else null end;
+    (.cachedUsageUtilization | obj) as $c
+    | select(($c.fetchedAtMs | type) == "number")
+    | select((.oauthAccount | obj | .accountUuid | type) == "string"
+             and $c.accountUuid == .oauthAccount.accountUuid)
+    | ($now - $c.fetchedAtMs / 1000 | floor) as $age
+    | select($age >= 0)
+    | ($c.utilization | obj) as $u
+    | ([ $u.limits | if type == "array" then .[] else empty end
+         | select(type == "object" and .kind == "weekly_scoped" and (.percent | type) == "number")
+         | { name: ((.scope | obj | (.model | obj | .display_name) // (.surface | obj | .display_name) // "")
+                    | if type == "string" then ascii_downcase | gsub("[^a-z0-9.]"; "") else "" end),
+             pct: ([.percent, 0] | max | floor),
+             reset: (.resets_at | epoch | int) }
+         | select(.reset == null or .reset > $now)
+         | "\(if .name == "" then "scoped" else .name end) \(.pct) \(.reset // "")" ]
+       | join(";")) as $scoped
+    | ($u.spend | obj) as $s
+    | ($s.used | obj) as $used | ($s.limit | obj) as $limit
+    | (($used.exponent // 2) | int) as $exp
+    | (($used.currency // "") | if type == "string" and test("^[A-Z]{3}$") then . else "" end) as $cur
+    | (if $age <= $credit_max_age and $s.enabled == true and ($used.amount_minor | type) == "number"
+          and ($limit.amount_minor | type) == "number" and $exp != null and $exp >= 0 and $exp <= 4
+       then [($used.amount_minor | int), ($limit.amount_minor | int), $exp, $cur]
+       else ["", "", "", ""] end) as $credit
+    | @sh "USAGE_AGE=\($age)
+SCOPED=\($scoped)
+CREDIT_USED=\($credit[0])
+CREDIT_LIMIT=\($credit[1])
+CREDIT_EXP=\($credit[2])
+CREDIT_CUR=\($credit[3])"' "$USAGE_FILE" 2>/dev/null) && eval "$USAGE_OUT"
+fi
+
+SC_NAMES=() SC_PCTS=() SC_RESETS=()
+if [ -n "$SCOPED" ]; then
+  IFS=';' read -r -a _sc_entries <<<"$SCOPED"
+  for _entry in "${_sc_entries[@]}"; do
+    read -r _name _pct _reset <<<"$_entry"
+    [[ "$_pct" =~ ^[0-9]+$ ]] || continue
+    SC_NAMES+=("$_name"); SC_PCTS+=("$_pct"); SC_RESETS+=("$_reset")
+  done
+fi
+
+USAGE_AGE_TAG=""
+if [[ "$USAGE_AGE" =~ ^[0-9]+$ ]] && [ "$USAGE_AGE" -gt "$USAGE_STALE_AFTER" ]; then
+  if   [ "$USAGE_AGE" -lt 3600 ];  then _age="$(( USAGE_AGE / 60 ))m"
+  elif [ "$USAGE_AGE" -lt 86400 ]; then _age="$(( USAGE_AGE / 3600 ))h"
+  else _age="$(( USAGE_AGE / 86400 ))d"
+  fi
+  USAGE_AGE_TAG=" ${DIM}(${_age})${RST}"
+fi
+
+# Minor units → "12.34" (exponent 2). With $3 = 1 a whole amount drops ".00".
+fmt_money() {
+  local minor=$1 exp=$2 trim=$3 scale=1 i
+  for ((i = 0; i < exp; i++)); do scale=$(( scale * 10 )); done
+  local whole=$(( minor / scale )) frac=$(( minor % scale ))
+  if [ "$exp" -eq 0 ] || { [ "$trim" = 1 ] && [ "$frac" -eq 0 ]; }; then echo "$whole"; return; fi
+  local frac_str="$frac"
+  while [ ${#frac_str} -lt "$exp" ]; do frac_str="0${frac_str}"; done
+  echo "${whole}.${frac_str}"
+}
+
+# Credits are shown once they are in use, or once some window is full — the point
+# where the next request on that model starts drawing on them.
+CREDIT_SEG=""
+if [[ "$CREDIT_USED" =~ ^[0-9]+$ ]] && [[ "$CREDIT_LIMIT" =~ ^[0-9]+$ ]] && [[ "$CREDIT_EXP" =~ ^[0-9]$ ]]; then
+  _show_credit=0
+  [ "$CREDIT_USED" -gt 0 ] && _show_credit=1
+  for _pct in "${SC_PCTS[@]}" "${SEVEN_D_PCT%%.*}" "${FIVE_H_PCT%%.*}"; do
+    [[ "$_pct" =~ ^[0-9]+$ ]] && [ "$_pct" -ge 100 ] && _show_credit=1
+  done
+  if [ $_show_credit -eq 1 ]; then
+    _sym='$'; [ -n "$CREDIT_CUR" ] && [ "$CREDIT_CUR" != "USD" ] && _sym="${CREDIT_CUR} "
+    _used_pct=0
+    [ "$CREDIT_LIMIT" -gt 0 ] && _used_pct=$(( CREDIT_USED * 100 / CREDIT_LIMIT ))
+    _c=$GRN  # same thresholds as cpct
+    [ "$_used_pct" -ge 50 ] && _c=$YLW
+    [ "$_used_pct" -ge 80 ] && _c=$RED
+    CREDIT_SEG="credits: ${_c}${_sym}$(fmt_money "$CREDIT_USED" "$CREDIT_EXP" 0)${RST}/${_sym}$(fmt_money "$CREDIT_LIMIT" "$CREDIT_EXP" 1)"
+  fi
+fi
+
 # ══════════════════════════════════════════════════════════════
 # LINE 2: Rate limits (cloud) OR Inference speed (local) + Cost
 # Progressive degradation:
 #   L0: full   L1: drop reset countdown / drop API duration
-#   L2: drop 7d (cloud only)   L3: only cost
+#   L2: drop 7d, spend and credits (cloud only; 5h and per-model limits stay)
+#   L3: only cost
 # ══════════════════════════════════════════════════════════════
 FIVE_INT=${FIVE_H_PCT%%.*}
 SEVEN_INT=${SEVEN_D_PCT%%.*}
@@ -604,6 +721,22 @@ build_l2() {
     seg="spend: $(cpct "$SPEND_INT")"
     [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "$SPEND_RESET")"
     parts+=("$seg")
+  fi
+
+  # Per-model weekly limits stay through L2, like 5h: on a plan that only reports
+  # 7d, dropping them there too would leave no window and fall through to tok/s.
+  # The stale-age tag goes on the last of these segments and survives every rung
+  # that shows them — dropping it is how an old figure would pass for a live one.
+  local usage_segs=() i
+  for ((i = 0; i < ${#SC_NAMES[@]}; i++)); do
+    seg="${SC_NAMES[$i]}: $(cpct "${SC_PCTS[$i]}")"
+    [ $level -lt 1 ] && [ -n "${SC_RESETS[$i]}" ] && seg="${seg} ⟳$(fmt_reset "${SC_RESETS[$i]}")"
+    usage_segs+=("$seg")
+  done
+  [ -n "$CREDIT_SEG" ] && [ $level -lt 2 ] && usage_segs+=("$CREDIT_SEG")
+  if [ ${#usage_segs[@]} -gt 0 ]; then
+    usage_segs[${#usage_segs[@]}-1]="${usage_segs[${#usage_segs[@]}-1]}${USAGE_AGE_TAG}"
+    parts+=("${usage_segs[@]}")
   fi
 
   if [ ${#parts[@]} -gt 0 ]; then

@@ -58,6 +58,7 @@ Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 - **Prompt cache diagnostics** — TTL (a red `5m` means the session is drawing on usage credits, where the subscription default is `1h`), time to expiry, miss count with its diagnosed cause (`miss:2(tools)`), and the tokens a cold cache would rewrite. Figures come from Claude Code's own `prompt_cache` object, which is scoped to the main conversation and excludes subagent traffic
 - **Session state that is otherwise invisible** — reasoning effort, fast mode (`⚡`, which doubles the per-token price on Opus), extended thinking being off, and `200k+` for the long-context mode
 - **Rate limits per window** — `5h` / `7d` / gateway `spend`. Each is independently optional and Claude Code drops a window once it resets, so they are read individually rather than gated on one another
+- **Per-model weekly limits and usage credits** — `fable: 100%` and `credits: $2.50/$20`, which the status line payload does not carry. On a plan where one model has its own weekly allowance, the overall `7d` can read 60% while that model is already at 100% and its requests are drawing on credits. See [Per-model limits](#per-model-limits) for where the figures come from and how far to trust them
 - **Open PR / MR state** — `#123✓` approved, `#123✗` changes requested, `#123·draft`
 - **Unpushed commits** — `↑2` means those commits exist only on this machine. Deliberately without a "behind" count: `origin/*` only moves on fetch, so a behind figure would report the state at the last fetch and read as an all-clear the script cannot give
 - **Auto-adapts** for cloud Claude (shows rate limits) vs local Ollama or an API key (shows inference tok/s, since no plan limits exist there)
@@ -95,6 +96,9 @@ Conditional fields appear only when they say something:
 | `COLD` / red `5m` | the cache has expired / its TTL dropped to 5 minutes, which means usage credits are in play |
 | `miss:2(tools)` | cache misses, with the diagnosed cause (`tools`, `sysprompt`, `ttl5m`, `server`) |
 | `spend: 88%` | behind a Claude apps gateway with a spend limit |
+| `fable: 100%` | the plan has a per-model weekly allowance (read from Claude Code's usage cache, see below) |
+| `credits: $2.50/$20` | usage credits are enabled and either some have been used or a window is full — the point where the next request on that model draws on them |
+| `(25m)` | the usage cache those two came from is more than 20 minutes old (`m` / `h` / `d`) |
 | `#123✗` | the branch has an open PR / MR, with its review state |
 | `↑2` | commits exist locally that are not on the upstream |
 | `+10/-3`, `2M 3A` | lines changed this session / git modified + untracked |
@@ -187,13 +191,29 @@ Line 2 is a second ruler exactly `BUDGET` wide, ending in `]`. If you can see th
 | Line | Order (least-to-most lossy) |
 |---|---|
 | L1 (identity) | Strip `Ctx: ` label → branch truncate 24→16 and repo 32→20 → abbreviate effort (`xhigh`→`X`) → compact model (`Opus 5 (1M)` → `O5·1M`) → drop repo → shrink `200k+` to `!` |
-| L2 (resources) | Drop reset countdowns → drop 7d and spend windows → cost only |
+| L2 (resources) | Drop reset countdowns → drop 7d, spend and credits (5h and per-model limits stay, so a plan that reports only 7d never loses its last window) → cost only |
 | L3 (usage) | Drop API wait % → drop `cold:` → drop cache expiry and miss detail → drop in/out tokens |
 | L4 (session) | Drop version → drop session duration → drop agent → drop worktree (git stats, lines `+/-`, unpushed count and PR state always kept) |
 
 Repo names longer than the current limit are truncated with a middle ellipsis (`dungeon-delvers-metadata-server` → `dungeon-delvers-…tadata-server` at full width, `dungeon-de…ta-server` once compressed).
 
 Two caveats worth knowing: wide characters **inside payload strings** (a CJK repo, branch or worktree name) are counted as one column each and can overrun the line — the width table covers only the glyphs this script emits itself. And East Asian Ambiguous characters (`│ █ · …`) are assumed to be one column, as most terminals render them.
+
+### Per-model limits
+
+The status line payload's `rate_limits` has `five_hour`, `seven_day` and `spend_limit` — nothing per model. Claude Code does fetch the full picture (the same data `/usage` shows) and keeps the latest response in `~/.claude.json` under `cachedUsageUtilization`. The script reads two things from there: each `limits[]` entry of kind `weekly_scoped` (shown under its model name), and `spend` (usage credits used / monthly limit).
+
+That key is an **undocumented internal cache**, so the script treats it with suspicion:
+
+- Anything unexpected — no file, another shape, unparsable JSON — and nothing extra is shown. The rest of the status line is unaffected.
+- The cached account must match the signed-in one, as Claude Code itself requires.
+- An entry whose `resets_at` has passed is dropped, as the payload's own windows are.
+- Past 20 minutes the age is shown — `fable: 100% (25m)` — so a figure that stopped updating does not pass for a live one.
+- An old per-model figure is still shown, with its age, until its window resets. Claude Code stops trusting this cache after an hour for its own decisions, but these windows are fixed weeks: within one the percentage only rises, so an old figure is a floor, never an all-clear. Credits count per month and carry no reset time, so they are dropped once the cache is a day old.
+
+**Keeping it fresh.** Claude Code refetches this only when something asks for usage — `/usage`, the model picker, an SDK `get_usage` call — not on a timer. Measured on 2.1.328: one write in 40 idle minutes, and that one was a manual run. `claude -p "/usage"` runs the slash command locally and refreshes the cache without calling a model (`num_turns: 0`, `total_cost_usd: 0`), so a scheduled run of it keeps the figures current. Without one, they update whenever you open `/usage` or the model picker, and the age tag says how old they are in between.
+
+It costs one extra `jq` over that file per refresh (a few milliseconds) and makes no request. `STATUSLINE_USAGE_FILE` points it at another file; the tests use that to pin a fixture.
 
 ### Refresh interval
 
@@ -290,6 +310,11 @@ It ages: if Claude Code changes the payload shape the suite stays green while
 testing a format that no longer exists. Recapture by having the script write its
 stdin to a file once, then removing that line.
 
+`tests/fixture-usage.json` stands in for `~/.claude.json` and is synthetic (fake
+account id, made-up figures). The suite rewrites its times relative to now on
+every run, and pins `STATUSLINE_USAGE_FILE` for every case, so no test ever reads
+the real file on the machine running it.
+
 CI runs `shellcheck -S warning` over the whole repository on every push.
 
 ---
@@ -331,7 +356,7 @@ The 4-line layout groups fields by semantic role so each line has a single theme
 | Line | Theme | Fields |
 |---|---|---|
 | L1 | **Identity & capacity** | Model, effort, mode flags, long-context marker, Repo:Branch, context window |
-| L2 | **Resource consumption** | 5h / 7d / spend windows (or inference speed where no plan limits exist), session cost |
+| L2 | **Resource consumption** | 5h / 7d / spend windows, per-model weekly limits, usage credits (or inference speed where no plan limits exist), session cost |
 | L3 | **Usage & cache** | Tokens in/out, cache hit rate, TTL and expiry, misses with cause, re-cache cost, API wait % |
 | L4 | **Session state** | Duration, lines changed, git stats, unpushed commits, PR state, worktree, agent, version |
 
