@@ -1,0 +1,8 @@
+{
+  "fetchedAt": 0,
+  "planType": "plus",
+  "windows": [
+    { "usedPercent": 4, "windowMins": 10080, "resetsAt": 0 }
+  ],
+  "resets": { "available": 3, "nextExpiresAt": 0 }
+}

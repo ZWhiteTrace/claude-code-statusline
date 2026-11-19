@@ -585,7 +585,7 @@ COST_FMT=$(printf '$%.2f' "$COST")
 # rises and an old figure is a floor, not an all-clear. It stays, with its age,
 # until its window resets. Credits carry no reset time and count per month, so
 # those are dropped after USAGE_CREDIT_MAX_AGE instead.
-# Running `claude -p /usage` on a schedule keeps it fresh; it calls no model.
+# usage-refresh.sh (in this repo) keeps it fresh on a schedule; it calls no model.
 # skipped: CLAUDE_CONFIG_DIR (moves the file), add when someone uses it —
 # STATUSLINE_USAGE_FILE points the script at another path meanwhile.
 USAGE_FILE="${STATUSLINE_USAGE_FILE:-$HOME/.claude.json}"
@@ -641,14 +641,17 @@ if [ -n "$SCOPED" ]; then
   done
 fi
 
-USAGE_AGE_TAG=""
-if [[ "$USAGE_AGE" =~ ^[0-9]+$ ]] && [ "$USAGE_AGE" -gt "$USAGE_STALE_AFTER" ]; then
-  if   [ "$USAGE_AGE" -lt 3600 ];  then _age="$(( USAGE_AGE / 60 ))m"
-  elif [ "$USAGE_AGE" -lt 86400 ]; then _age="$(( USAGE_AGE / 3600 ))h"
-  else _age="$(( USAGE_AGE / 86400 ))d"
+# " (25m)" once a cached figure is older than USAGE_STALE_AFTER seconds, else "".
+age_tag() {
+  local age=$1 unit
+  [[ "$age" =~ ^[0-9]+$ ]] && [ "$age" -gt "$USAGE_STALE_AFTER" ] || return 0
+  if   [ "$age" -lt 3600 ];  then unit="$(( age / 60 ))m"
+  elif [ "$age" -lt 86400 ]; then unit="$(( age / 3600 ))h"
+  else unit="$(( age / 86400 ))d"
   fi
-  USAGE_AGE_TAG=" ${DIM}(${_age})${RST}"
-fi
+  printf ' %s(%s)%s' "$DIM" "$unit" "$RST"
+}
+USAGE_AGE_TAG=$(age_tag "$USAGE_AGE")
 
 # Minor units → "12.34" (exponent 2). With $3 = 1 a whole amount drops ".00".
 fmt_money() {
@@ -681,12 +684,56 @@ if [[ "$CREDIT_USED" =~ ^[0-9]+$ ]] && [[ "$CREDIT_LIMIT" =~ ^[0-9]+$ ]] && [[ "
   fi
 fi
 
+# === Codex usage (written by usage-refresh.sh, not by Claude Code) ===
+# usage-refresh.sh asks `codex app-server` for account/rateLimits/read and keeps
+# the windows (used %, length, reset time) and the number of free resets on the
+# account. No file — the refresher is not scheduled, or Codex is not installed —
+# shows nothing. The same rules as the Claude figures apply: a window past its
+# reset is dropped, and past USAGE_STALE_AFTER the age is shown.
+CODEX_FILE="${STATUSLINE_CODEX_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline/codex-rate-limits.json}"
+CODEX_AGE="" CODEX_WINDOWS="" CODEX_RESETS=0
+if [ -f "$CODEX_FILE" ]; then
+  CODEX_OUT=$(jq -r --argjson now "$(date +%s)" '
+    def num: type == "number";
+    select(type == "object" and (.fetchedAt | num))
+    | ($now - .fetchedAt | floor) as $age
+    | select($age >= 0)
+    | ([ .windows | if type == "array" then .[] else empty end
+         | select(type == "object" and (.usedPercent | num) and (.windowMins | num)
+                  and (.resetsAt | num) and .windowMins > 0 and .resetsAt > $now)
+         | "\(.windowMins | floor) \([.usedPercent, 0] | max | floor) \(.resetsAt | floor)" ]
+       | join(";")) as $windows
+    | ((.resets | if type == "object" then .available else null end)
+       | if num and . > 0 then floor else 0 end) as $resets
+    | @sh "CODEX_AGE=\($age)
+CODEX_WINDOWS=\($windows)
+CODEX_RESETS=\($resets)"' "$CODEX_FILE" 2>/dev/null) && eval "$CODEX_OUT"
+fi
+
+# A window's label is its length (5h, 7d); a single window is just "codex".
+CX_LABELS=() CX_PCTS=() CX_RESETS=()
+if [ -n "$CODEX_WINDOWS" ]; then
+  IFS=';' read -r -a _cx_entries <<<"$CODEX_WINDOWS"
+  for _entry in "${_cx_entries[@]}"; do
+    read -r _mins _pct _reset <<<"$_entry"
+    [[ "$_mins" =~ ^[0-9]+$ ]] && [[ "$_pct" =~ ^[0-9]+$ ]] && [[ "$_reset" =~ ^[0-9]+$ ]] || continue
+    if   [ $(( _mins % 1440 )) -eq 0 ]; then _label="$(( _mins / 1440 ))d"
+    elif [ $(( _mins % 60 )) -eq 0 ];   then _label="$(( _mins / 60 ))h"
+    else _label="${_mins}m"
+    fi
+    CX_LABELS+=("codex ${_label}"); CX_PCTS+=("$_pct"); CX_RESETS+=("$_reset")
+  done
+  [ ${#CX_LABELS[@]} -eq 1 ] && CX_LABELS[0]="codex"
+fi
+[[ "$CODEX_RESETS" =~ ^[0-9]+$ ]] || CODEX_RESETS=0
+CODEX_AGE_TAG=$(age_tag "$CODEX_AGE")
+
 # ══════════════════════════════════════════════════════════════
 # LINE 2: Rate limits (cloud) OR Inference speed (local) + Cost
 # Progressive degradation:
-#   L0: full   L1: drop reset countdown / drop API duration
-#   L2: drop 7d, spend and credits (cloud only; 5h and per-model limits stay)
-#   L3: only cost
+#   L0: full   L1: drop reset countdowns, Codex reset count / drop API duration
+#   L2: drop 7d, spend and credits (cloud only; 5h, per-model limits, Codex stay)
+#   L3: drop Codex   L4: only cost
 # ══════════════════════════════════════════════════════════════
 FIVE_INT=${FIVE_H_PCT%%.*}
 SEVEN_INT=${SEVEN_D_PCT%%.*}
@@ -700,7 +747,7 @@ fi
 
 build_l2() {
   local level=$1
-  [ $level -ge 3 ] && { echo "$COST_FMT"; return; }
+  [ $level -ge 4 ] && { echo "$COST_FMT"; return; }
   local parts=() seg L=""
 
   # Every window is independently optional, and Claude Code drops one once its
@@ -739,6 +786,25 @@ build_l2() {
     parts+=("${usage_segs[@]}")
   fi
 
+  # Codex comes after every Claude figure and is the last thing dropped before
+  # the cost-only rung. Its age tag is its own: a different file, refreshed by a
+  # different call, can go stale on its own.
+  local codex_segs=() resets_word="resets"
+  if [ $level -lt 3 ]; then
+    for ((i = 0; i < ${#CX_LABELS[@]}; i++)); do
+      seg="${CX_LABELS[$i]}: $(cpct "${CX_PCTS[$i]}")"
+      [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "${CX_RESETS[$i]}")"
+      codex_segs+=("$seg")
+    done
+  fi
+  if [ ${#codex_segs[@]} -gt 0 ]; then
+    [ "$CODEX_RESETS" -eq 1 ] && resets_word="reset"
+    [ $level -lt 1 ] && [ "$CODEX_RESETS" -gt 0 ] && \
+      codex_segs[${#codex_segs[@]}-1]="${codex_segs[${#codex_segs[@]}-1]} · ${CODEX_RESETS} ${resets_word}"
+    codex_segs[${#codex_segs[@]}-1]="${codex_segs[${#codex_segs[@]}-1]}${CODEX_AGE_TAG}"
+    parts+=("${codex_segs[@]}")
+  fi
+
   if [ ${#parts[@]} -gt 0 ]; then
     for seg in "${parts[@]}"; do
       if [ -n "$L" ]; then L="${L} │ ${seg}"; else L="$seg"; fi
@@ -757,7 +823,7 @@ build_l2() {
   echo "${L} │ ${COST_FMT}"
 }
 
-for _lvl in 0 1 2 3; do
+for _lvl in 0 1 2 3 4; do
   L2=$(build_l2 $_lvl)
   [ "$(visible_len "$L2")" -le "$BUDGET" ] && break
 done

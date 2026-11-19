@@ -59,6 +59,7 @@ Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 - **Session state that is otherwise invisible** — reasoning effort, fast mode (`⚡`, which doubles the per-token price on Opus), extended thinking being off, and `200k+` for the long-context mode
 - **Rate limits per window** — `5h` / `7d` / gateway `spend`. Each is independently optional and Claude Code drops a window once it resets, so they are read individually rather than gated on one another
 - **Per-model weekly limits and usage credits** — `fable: 100%` and `credits: $2.50/$20`, which the status line payload does not carry. On a plan where one model has its own weekly allowance, the overall `7d` can read 60% while that model is already at 100% and its requests are drawing on credits. See [Per-model limits](#per-model-limits) for where the figures come from and how far to trust them
+- **Codex usage alongside** — `codex: 4% ⟳5d16h · 3 resets`: the Codex weekly (and 5-hour, where the plan has one) window, its reset time, and how many free resets the account holds. Read from a small file that [`usage-refresh.sh`](#keeping-the-usage-figures-fresh) writes
 - **Open PR / MR state** — `#123✓` approved, `#123✗` changes requested, `#123·draft`
 - **Unpushed commits** — `↑2` means those commits exist only on this machine. Deliberately without a "behind" count: `origin/*` only moves on fetch, so a behind figure would report the state at the last fetch and read as an all-clear the script cannot give
 - **Auto-adapts** for cloud Claude (shows rate limits) vs local Ollama or an API key (shows inference tok/s, since no plan limits exist there)
@@ -98,7 +99,8 @@ Conditional fields appear only when they say something:
 | `spend: 88%` | behind a Claude apps gateway with a spend limit |
 | `fable: 100%` | the plan has a per-model weekly allowance (read from Claude Code's usage cache, see below) |
 | `credits: $2.50/$20` | usage credits are enabled and either some have been used or a window is full — the point where the next request on that model draws on them |
-| `(25m)` | the usage cache those two came from is more than 20 minutes old (`m` / `h` / `d`) |
+| `codex: 4% ⟳5d16h · 3 resets` | `usage-refresh.sh` has recorded Codex usage. Two windows show as `codex 5h:` and `codex 7d:` |
+| `(25m)` | the figures before it are more than 20 minutes old (`m` / `h` / `d`). Claude's and Codex's are aged separately |
 | `#123✗` | the branch has an open PR / MR, with its review state |
 | `↑2` | commits exist locally that are not on the upstream |
 | `+10/-3`, `2M 3A` | lines changed this session / git modified + untracked |
@@ -191,7 +193,7 @@ Line 2 is a second ruler exactly `BUDGET` wide, ending in `]`. If you can see th
 | Line | Order (least-to-most lossy) |
 |---|---|
 | L1 (identity) | Strip `Ctx: ` label → branch truncate 24→16 and repo 32→20 → abbreviate effort (`xhigh`→`X`) → compact model (`Opus 5 (1M)` → `O5·1M`) → drop repo → shrink `200k+` to `!` |
-| L2 (resources) | Drop reset countdowns → drop 7d, spend and credits (5h and per-model limits stay, so a plan that reports only 7d never loses its last window) → cost only |
+| L2 (resources) | Drop reset countdowns and the Codex reset count → drop 7d, spend and credits (5h, per-model limits and Codex stay, so a plan that reports only 7d never loses its last window) → drop Codex → cost only |
 | L3 (usage) | Drop API wait % → drop `cold:` → drop cache expiry and miss detail → drop in/out tokens |
 | L4 (session) | Drop version → drop session duration → drop agent → drop worktree (git stats, lines `+/-`, unpushed count and PR state always kept) |
 
@@ -211,9 +213,24 @@ That key is an **undocumented internal cache**, so the script treats it with sus
 - Past 20 minutes the age is shown — `fable: 100% (25m)` — so a figure that stopped updating does not pass for a live one.
 - An old per-model figure is still shown, with its age, until its window resets. Claude Code stops trusting this cache after an hour for its own decisions, but these windows are fixed weeks: within one the percentage only rises, so an old figure is a floor, never an all-clear. Credits count per month and carry no reset time, so they are dropped once the cache is a day old.
 
-**Keeping it fresh.** Claude Code refetches this only when something asks for usage — `/usage`, the model picker, an SDK `get_usage` call — not on a timer. Measured on 2.1.328: one write in 40 idle minutes, and that one was a manual run. `claude -p "/usage"` runs the slash command locally and refreshes the cache without calling a model (`num_turns: 0`, `total_cost_usd: 0`), so a scheduled run of it keeps the figures current. Without one, they update whenever you open `/usage` or the model picker, and the age tag says how old they are in between.
+Claude Code refetches this cache only when something asks for usage — `/usage`, the model picker, an SDK `get_usage` call — not on a timer (measured on 2.1.328: one write in 40 idle minutes). Without a scheduled refresh the figures update whenever you open one of those, and the age tag says how old they are in between. See [Keeping the usage figures fresh](#keeping-the-usage-figures-fresh).
 
 It costs one extra `jq` over that file per refresh (a few milliseconds) and makes no request. `STATUSLINE_USAGE_FILE` points it at another file; the tests use that to pin a fixture.
+
+### Keeping the usage figures fresh
+
+`usage-refresh.sh` updates both sources the second row reads, and is meant to run on a schedule. It calls no model and spends no quota.
+
+- **Claude** — runs `claude -p "/usage"`, which makes Claude Code refetch usage and rewrite its cache. Measured: `num_turns: 0`, `total_cost_usd: 0`. It passes `disableAllHooks` (otherwise every run fires your SessionStart hooks), `--no-session-persistence` (no session file left behind) and an empty MCP config. `--bare` would skip hooks too, but it also turns off OAuth sign-in, so it cannot be used on a subscription.
+- **Codex** — starts `codex app-server` and sends one read, `account/rateLimits/read`, without opening a thread. The answer is cut down to the windows, the plan and the free-reset count — no account or reset-credit ids — and written atomically to `${XDG_CACHE_HOME:-~/.cache}/claude-statusline/codex-rate-limits.json` (`STATUSLINE_CODEX_FILE` overrides). Only an allow-listed read is ever sent; `account/rateLimitResetCredit/consume`, which would spend a reset, is refused before anything reaches the server. Needs `python3`; skipped without it or without `codex`.
+- It does nothing while no interactive Claude Code session (a `claude` process with a terminal) is running, and prints only on failure. A failed Codex read keeps the previous file, so the figure ages instead of disappearing.
+
+```bash
+curl -o ~/.claude/usage-refresh.sh https://raw.githubusercontent.com/ZWhiteTrace/claude-code-statusline/main/usage-refresh.sh
+chmod +x ~/.claude/usage-refresh.sh
+```
+
+Schedule it every 15 minutes. With cron: `*/15 * * * * ~/.claude/usage-refresh.sh >> ~/.claude/usage-refresh.log 2>&1`. On macOS a LaunchAgent with `StartInterval` `900` works too; give it a `PATH` that contains `claude` and `codex` (launchd's default does not include `~/.local/bin` or `/opt/homebrew/bin`).
 
 ### Refresh interval
 
@@ -285,6 +302,7 @@ token count.
 ```bash
 tests/run_tests.sh        # main status line
 tests/test_subagent.sh    # subagent status line
+tests/test_usage_refresh.sh  # usage-refresh.sh, against fake ps / claude / codex
 ```
 
 Three assertions on every case:
@@ -310,10 +328,16 @@ It ages: if Claude Code changes the payload shape the suite stays green while
 testing a format that no longer exists. Recapture by having the script write its
 stdin to a file once, then removing that line.
 
-`tests/fixture-usage.json` stands in for `~/.claude.json` and is synthetic (fake
-account id, made-up figures). The suite rewrites its times relative to now on
-every run, and pins `STATUSLINE_USAGE_FILE` for every case, so no test ever reads
-the real file on the machine running it.
+`tests/fixture-usage.json` stands in for `~/.claude.json` and
+`tests/fixture-codex.json` for the Codex file; both are synthetic (fake account
+id, made-up figures). The suite rewrites their times relative to now on every run
+and pins `STATUSLINE_USAGE_FILE` and `STATUSLINE_CODEX_FILE` for every case, so no
+test ever reads the real files on the machine running it.
+
+`test_usage_refresh.sh` puts fake `ps`, `claude` and `codex` first on `PATH`, so
+the script runs its real process check and its real JSON-RPC exchange against a
+stand-in `codex app-server` whose answers each case sets: normal, error, no usable
+window, closed output, and one that never answers.
 
 CI runs `shellcheck -S warning` over the whole repository on every push.
 
@@ -356,7 +380,7 @@ The 4-line layout groups fields by semantic role so each line has a single theme
 | Line | Theme | Fields |
 |---|---|---|
 | L1 | **Identity & capacity** | Model, effort, mode flags, long-context marker, Repo:Branch, context window |
-| L2 | **Resource consumption** | 5h / 7d / spend windows, per-model weekly limits, usage credits (or inference speed where no plan limits exist), session cost |
+| L2 | **Resource consumption** | 5h / 7d / spend windows, per-model weekly limits, usage credits, Codex usage (or inference speed where no plan limits exist), session cost |
 | L3 | **Usage & cache** | Tokens in/out, cache hit rate, TTL and expiry, misses with cause, re-cache cost, API wait % |
 | L4 | **Session state** | Duration, lines changed, git stats, unpushed commits, PR state, worktree, agent, version |
 

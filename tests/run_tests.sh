@@ -33,6 +33,7 @@ render() (
   cd "$REPO_CWD" 2>/dev/null || cd "$DIR" || exit 1
   unset STATUSLINE_MAX_WIDTH STATUSLINE_SHORT_MODEL STATUSLINE_DEBUG
   STATUSLINE_USAGE_FILE="${USAGE_FILE_UNDER_TEST:-$DIR/no-such-usage-file}" \
+    STATUSLINE_CODEX_FILE="${CODEX_FILE_UNDER_TEST:-$DIR/no-such-codex-file}" \
     STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
 )
 
@@ -362,9 +363,104 @@ if [ "$seen_l2" -eq 0 ]; then echo "  *** FAIL  控制組：沒有任何寬度�
 elif [ "$bad" = 0 ]; then echo "  PASS  20..200 欄都保留 Fable（其中 $seen_l2 個寬度落在 L2）"
 else FAIL=$((FAIL+1)); fi
 
+echo "############ Codex 額度（讀 usage-refresh.sh 寫的檔） ############"
+cxfile() {  # cxfile <file name> [jq mutation applied after the times are set]
+  local now; now=$(date +%s)
+  jq --argjson now "$now" '
+    .fetchedAt = ($now - 60)
+    | .windows[].resetsAt = ($now + 43200)
+    | .resets.nextExpiresAt = ($now + 864000)
+    | '"${2:-.}" "$DIR/fixture-codex.json" > "$USAGE_TMP/$1"
+  printf '%s' "$USAGE_TMP/$1"
+}
+_cl2() { ( CODEX_FILE_UNDER_TEST=$1; USAGE_FILE_UNDER_TEST=${3:-}; render "${2:-$BASE}" "${4:-132}" ) | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g'; }
+_ccheck() {  # _ccheck <name> <codex file> <expected substring, or !substring>...
+  local name=$1 file=$2 l2 want ok=1; shift 2
+  l2=$(_cl2 "$file")
+  for want in "$@"; do
+    if [[ "$want" == "!"* ]]; then [[ "$l2" == *"${want#!}"* ]] && ok=0
+    else [[ "$l2" == *"$want"* ]] || ok=0; fi
+  done
+  if [ $ok = 1 ]; then echo "  PASS  $name: $l2"; else echo "  *** FAIL  $name: ${l2}（期望 $*）"; FAIL=$((FAIL+1)); fi
+}
+
+echo "### X1: 控制組與基本顯示 ###"
+_ccheck "單一時窗 → codex: 4% 與倒數、重置次數" "$(cxfile base.json)" "codex: 4% ⟳1" "· 3 resets │" "7d: 41%"
+_ccheck "不給檔案 → 不顯示" "$DIR/no-such-codex-file" "!codex" "7d: 41%"
+_ccheck "兩個時窗 → 各自標長度" "$(cxfile two.json '.windows = [{usedPercent:12,windowMins:300,resetsAt:($now+3600)}, {usedPercent:4,windowMins:10080,resetsAt:($now+86400)}]')" "codex 5h: 12% ⟳" "codex 7d: 4% ⟳" "!codex: "
+_ccheck "長度不是整小時 → 用分鐘" "$(cxfile odd.json '.windows = [{usedPercent:1,windowMins:90,resetsAt:($now+3600)}, {usedPercent:2,windowMins:10080,resetsAt:($now+86400)}]')" "codex 90m: 1%" "codex 7d: 2%"
+_ccheck "1 次重置 → 單數" "$(cxfile one.json '.resets.available = 1')" "· 1 reset │"
+_ccheck "沒有重置 → 不顯示次數" "$(cxfile none.json '.resets.available = 0')" "codex: 4% ⟳" "!reset"
+_ccheck "用量 100% → 照實顯示" "$(cxfile full.json '.windows[0].usedPercent = 100')" "codex: 100%"
+_ccheck "負的百分比 → 0" "$(cxfile neg.json '.windows[0].usedPercent = -3')" "codex: 0%"
+
+echo "### X2: 過時與過期 ###"
+_ccheck "21 分鐘前 → 標年齡" "$(cxfile stale.json '.fetchedAt -= 1200')" "· 3 resets (21m)"
+_ccheck "11 分鐘前 → 不標" "$(cxfile recent.json '.fetchedAt -= 600')" "codex: 4%" "!m)"
+_ccheck "抓取時間在未來 → 不顯示" "$(cxfile future.json '.fetchedAt += 600')" "!codex"
+_ccheck "時窗已重置 → 該時窗不顯示" "$(cxfile reset.json '.windows[0].resetsAt = 1')" "!codex"
+_ccheck "兩個時窗其一已重置 → 只留另一個（不再標長度）" "$(cxfile half.json '.windows = [{usedPercent:12,windowMins:300,resetsAt:1}, {usedPercent:4,windowMins:10080,resetsAt:($now+86400)}]')" "codex: 4%" "!codex 5h" "!codex 7d"
+# Each source carries its own age: a fresh Claude cache must not hide a stale Codex one.
+out=$(_cl2 "$(cxfile own-age.json '.fetchedAt -= 1500')" "$BASE" "$(usage own-age-u.json)")
+if [[ "$out" == *"credits: \$0.00/\$10 │ codex: 4%"*"(26m)"* && "$out" != *"/\$10 ("* ]]; then echo "  PASS  年齡各自計算: $out"
+else echo "  *** FAIL  年齡沒有各自計算: $out"; FAIL=$((FAIL+1)); fi
+
+echo "### X3: 格式異常一律不得弄壞 statusline ###"
+printf 'not json' > "$USAGE_TMP/codex-garbage.json"
+for f in "$USAGE_TMP/codex-garbage.json" \
+         "$(cxfile windows-string.json '.windows = "x"')" \
+         "$(cxfile pct-string.json '.windows[0].usedPercent = "4"')" \
+         "$(cxfile mins-zero.json '.windows[0].windowMins = 0')" \
+         "$(cxfile no-fetched.json 'del(.fetchedAt)')" \
+         "$(cxfile resets-string.json '.resets = "x"')" \
+         "$(cxfile root-array.json '[.]')"; do
+  out=$( CODEX_FILE_UNDER_TEST=$f; render "$BASE" 132 )
+  n=$(printf '%s' "$out" | grep -c '')
+  l2=$(printf '%s\n' "$out" | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g')
+  if [ "$n" = "4" ] && [[ "$l2" == *"7d: 41%"* ]] && ! printf '%s' "$out" | grep -q "jq error"; then
+    echo "  PASS  $(basename "$f") → 4 行、原本的時窗還在: $l2"
+  else
+    echo "  *** FAIL  $(basename "$f") → $n 行: $l2"; FAIL=$((FAIL+1))
+  fi
+done
+_ccheck "時窗長度 0 → 不顯示" "$(cxfile mins-zero-hidden.json '.windows[0].windowMins = 0')" "!codex" "7d: 41%"
+_ccheck "resets 異常 → 時窗照常、不顯示次數" "$(cxfile resets-bad.json '.resets.available = "3"')" "codex: 4% ⟳" "!reset"
+
+echo "### X4: 寬度契約與降級順序（Claude 用量檔＋Codex 檔都在） ###"
+USAGE_FILE_UNDER_TEST=$(usage x4-usage.json '.cachedUsageUtilization.fetchedAtMs -= 1500000')
+CODEX_FILE_UNDER_TEST=$(cxfile x4-codex.json '.fetchedAt -= 1500 | .windows = [{usedPercent:12,windowMins:300,resetsAt:($now+3600)}, {usedPercent:4,windowMins:10080,resetsAt:($now+86400)}]')
+sweep "usage + codex 兩時窗＋年齡" "$(mut '.rate_limits.spend_limit = {used_percentage:88,resets_at:1790301600}')" 20 200
+unset USAGE_FILE_UNDER_TEST CODEX_FILE_UNDER_TEST
+# Codex is kept after 7d is dropped (L2) and dropped before the cost-only rung (L3).
+X4_USAGE=$(usage x4b-usage.json) X4_CODEX=$(cxfile x4b-codex.json)
+seen_l2=0 seen_l3=0 bad=0
+for ((w = 20; w <= 200; w++)); do
+  l2=$(_cl2 "$X4_CODEX" "$SEVEN_ONLY_U" "$X4_USAGE" "$w")
+  case "$l2" in *"tok/s"*|*"waiting"*) echo "  *** FAIL  @ COLUMNS=$w 退回無限額畫面 → $l2"; bad=1; break ;; esac
+  [[ "$l2" == *"codex:"* && "$l2" != *"7d:"* ]] && seen_l2=$((seen_l2 + 1))
+  [[ "$l2" == *"fable:"* && "$l2" != *"codex"* ]] && seen_l3=$((seen_l3 + 1))
+  if [[ "$l2" == *"7d:"* && "$l2" != *"codex:"* ]]; then
+    echo "  *** FAIL  @ COLUMNS=$w 7d 還在、codex 卻先被丟 → $l2"; bad=1; break
+  fi
+done
+if [ "$seen_l2" -eq 0 ] || [ "$seen_l3" -eq 0 ]; then
+  echo "  *** FAIL  控制組：L2（codex 留、7d 丟）$seen_l2 個寬度、L3（codex 丟、fable 留）$seen_l3 個寬度，至少要各有一個"; FAIL=$((FAIL+1))
+elif [ "$bad" = 0 ]; then echo "  PASS  降級順序正確（L2 $seen_l2 個寬度、L3 $seen_l3 個寬度）"
+else FAIL=$((FAIL+1)); fi
+
+echo "### X5: 很窄時第 2 行要乾淨地退到只剩費用，不能被硬截 ###"
+# width_oracle.py flags a clamp only from budget 35 up; below that only this
+# catches a missing cost-only rung, which would hard-cut "fable: 10…" instead.
+bad=0
+for ((w = 20; w <= 40; w++)); do
+  l2=$(_cl2 "$X4_CODEX" "$SEVEN_ONLY_U" "$X4_USAGE" "$w")
+  if [[ "$l2" == *"…" ]]; then echo "  *** FAIL  @ COLUMNS=$w 被硬截 → $l2"; bad=1; break; fi
+done
+[ "$bad" = 0 ] && echo "  PASS  20..40 欄都沒有被硬截" || FAIL=$((FAIL+1))
+
 echo "############ 使用者真實設定 ############"
 echo "### STATUSLINE_MAX_WIDTH=75 + SHORT_MODEL=1（settings.json 實際值） ###"
-out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
+out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" STATUSLINE_CODEX_FILE="$DIR/no-such-codex-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
 printf '%s\n' "$out"
 assert "user real settings" "$out" 70
 
