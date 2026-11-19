@@ -34,6 +34,7 @@ render() (
   unset STATUSLINE_MAX_WIDTH STATUSLINE_SHORT_MODEL STATUSLINE_DEBUG
   STATUSLINE_USAGE_FILE="${USAGE_FILE_UNDER_TEST:-$DIR/no-such-usage-file}" \
     STATUSLINE_CODEX_FILE="${CODEX_FILE_UNDER_TEST:-$DIR/no-such-codex-file}" \
+    STATUSLINE_REFRESH_STATUS_FILE="${STATUS_FILE_UNDER_TEST:-$DIR/no-such-status-file}" \
     STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
 )
 
@@ -458,9 +459,66 @@ for ((w = 20; w <= 40; w++)); do
 done
 [ "$bad" = 0 ] && echo "  PASS  20..40 欄都沒有被硬截" || FAIL=$((FAIL+1))
 
+echo "############ 背景更新失敗的警示 usage✗（讀 usage-refresh.sh 的狀態檔） ############"
+statusfile() {  # statusfile <file name> <jq expression building the object; $now is available>
+  jq -n --argjson now "$(date +%s)" "$2" > "$USAGE_TMP/$1"
+  printf '%s' "$USAGE_TMP/$1"
+}
+_wl2() { ( STATUS_FILE_UNDER_TEST=$1; CODEX_FILE_UNDER_TEST=${3:-}; USAGE_FILE_UNDER_TEST=${4:-}; render "${2:-$BASE}" "${5:-132}" ) | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g'; }
+_wcheck() {  # _wcheck <name> <status file> <expected substring, or !substring>...
+  local name=$1 file=$2 l2 want ok=1; shift 2
+  l2=$(_wl2 "$file")
+  for want in "$@"; do
+    if [[ "$want" == "!"* ]]; then [[ "$l2" == *"${want#!}"* ]] && ok=0
+    else [[ "$l2" == *"$want"* ]] || ok=0; fi
+  done
+  if [ $ok = 1 ]; then echo "  PASS  $name: $l2"; else echo "  *** FAIL  $name: ${l2}（期望 $*）"; FAIL=$((FAIL+1)); fi
+}
+
+echo "### W1: 什麼時候亮 ###"
+_wcheck "剛跑完、有問題 → 亮，接在費用前" "$(statusfile bad.json '{checkedAt: $now, problems: ["claude: usage cache: shape not recognised"]}')" "│ usage✗ │ \$1.23" "7d: 41%"
+_wcheck "剛跑完、沒問題 → 不亮" "$(statusfile good.json '{checkedAt: $now, problems: []}')" "!usage✗" "7d: 41%"
+_wcheck "沒有狀態檔 → 不亮" "$DIR/no-such-status-file" "!usage✗"
+_wcheck "有問題但已超過一天 → 不亮（交給年齡標記）" "$(statusfile old.json '{checkedAt: ($now - 86460), problems: ["codex: exit=1"]}')" "!usage✗"
+_wcheck "有問題、23 小時前 → 仍亮" "$(statusfile day.json '{checkedAt: ($now - 82800), problems: ["codex: exit=1"]}')" "usage✗"
+_wcheck "時間在未來 → 不亮" "$(statusfile future.json '{checkedAt: ($now + 600), problems: ["codex: exit=1"]}')" "!usage✗"
+# The flag must not stand in for a plan window: with no window it sits beside tok/s.
+out=$(_wl2 "$(statusfile no-window.json '{checkedAt: $now, problems: ["x"]}')" "$(mut 'del(.rate_limits)')")
+if [[ "$out" == *"tok/s"*"usage✗"* ]]; then echo "  PASS  沒有時窗時照樣顯示吞吐，警示在旁邊: $out"
+else echo "  *** FAIL  警示取代了吞吐顯示: $out"; FAIL=$((FAIL+1)); fi
+
+echo "### W2: 格式異常不亮、也不得弄壞 statusline ###"
+printf 'not json' > "$USAGE_TMP/status-garbage.json"
+for f in "$USAGE_TMP/status-garbage.json" \
+         "$(statusfile problems-string.json '{checkedAt: $now, problems: "x"}')" \
+         "$(statusfile no-checked.json '{problems: ["x"]}')" \
+         "$(statusfile checked-string.json '{checkedAt: "now", problems: ["x"]}')" \
+         "$(statusfile root-array.json '[{checkedAt: $now, problems: ["x"]}]')"; do
+  out=$( STATUS_FILE_UNDER_TEST=$f; render "$BASE" 132 )
+  n=$(printf '%s' "$out" | grep -c '')
+  l2=$(printf '%s\n' "$out" | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g')
+  if [ "$n" = "4" ] && [[ "$l2" == *"7d: 41%"* ]] && [[ "$l2" != *"usage✗"* ]]; then
+    echo "  PASS  $(basename "$f") → 4 行、不亮: $l2"
+  else
+    echo "  *** FAIL  $(basename "$f") → $n 行: $l2"; FAIL=$((FAIL+1))
+  fi
+done
+
+echo "### W3: 寬度契約，以及每一層都留著警示（最窄只剩費用那層也是） ###"
+W_STATUS=$(statusfile w3.json '{checkedAt: $now, problems: ["claude: exit=1"]}')
+STATUS_FILE_UNDER_TEST=$W_STATUS USAGE_FILE_UNDER_TEST=$X4_USAGE CODEX_FILE_UNDER_TEST=$X4_CODEX
+sweep "usage + codex + usage✗" "$(mut '.rate_limits.spend_limit = {used_percentage:88,resets_at:1790301600}')" 20 200
+unset STATUS_FILE_UNDER_TEST USAGE_FILE_UNDER_TEST CODEX_FILE_UNDER_TEST
+bad=0
+for ((w = 20; w <= 200; w++)); do
+  l2=$(_wl2 "$W_STATUS" "$SEVEN_ONLY_U" "$X4_CODEX" "$X4_USAGE" "$w")
+  if [[ "$l2" != *"usage✗"* ]]; then echo "  *** FAIL  @ COLUMNS=$w 警示不見了 → $l2"; bad=1; break; fi
+done
+[ "$bad" = 0 ] && echo "  PASS  20..200 欄都看得到 usage✗" || FAIL=$((FAIL+1))
+
 echo "############ 使用者真實設定 ############"
 echo "### STATUSLINE_MAX_WIDTH=75 + SHORT_MODEL=1（settings.json 實際值） ###"
-out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" STATUSLINE_CODEX_FILE="$DIR/no-such-codex-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
+out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" STATUSLINE_CODEX_FILE="$DIR/no-such-codex-file" STATUSLINE_REFRESH_STATUS_FILE="$DIR/no-such-status-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
 printf '%s\n' "$out"
 assert "user real settings" "$out" 70
 

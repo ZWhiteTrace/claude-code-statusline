@@ -728,12 +728,29 @@ fi
 [[ "$CODEX_RESETS" =~ ^[0-9]+$ ]] || CODEX_RESETS=0
 CODEX_AGE_TAG=$(age_tag "$CODEX_AGE")
 
+# === Did the last usage refresh report a problem? ===
+# usage-refresh.sh records each run's outcome, including "the Claude usage cache
+# is no longer in a shape this script reads". Without this flag that case is
+# silent: the per-model limits just disappear. Shown while the last run, at most
+# a day ago, listed a problem; an older record means the refresher stopped
+# running, which the age tags already show. The reason is in the file itself.
+REFRESH_STATUS_FILE="${STATUSLINE_REFRESH_STATUS_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline/refresh-status.json}"
+REFRESH_FAILED=0
+if [ -f "$REFRESH_STATUS_FILE" ]; then
+  REFRESH_FAILED=$(jq -r --argjson now "$(date +%s)" '
+    if type == "object" and (.checkedAt | type) == "number"
+       and ($now - .checkedAt) >= 0 and ($now - .checkedAt) <= 86400
+       and (.problems | type) == "array" and (.problems | length) > 0
+    then 1 else 0 end' "$REFRESH_STATUS_FILE" 2>/dev/null)
+  [ "$REFRESH_FAILED" = 1 ] || REFRESH_FAILED=0
+fi
+
 # ══════════════════════════════════════════════════════════════
 # LINE 2: Rate limits (cloud) OR Inference speed (local) + Cost
 # Progressive degradation:
 #   L0: full   L1: drop reset countdowns, Codex reset count / drop API duration
 #   L2: drop 7d, spend and credits (cloud only; 5h, per-model limits, Codex stay)
-#   L3: drop Codex   L4: only cost
+#   L3: drop Codex   L4: only cost (and usage✗ when the last refresh failed)
 # ══════════════════════════════════════════════════════════════
 FIVE_INT=${FIVE_H_PCT%%.*}
 SEVEN_INT=${SEVEN_D_PCT%%.*}
@@ -747,7 +764,10 @@ fi
 
 build_l2() {
   local level=$1
-  [ $level -ge 4 ] && { echo "$COST_FMT"; return; }
+  if [ $level -ge 4 ]; then
+    if [ "$REFRESH_FAILED" = 1 ]; then echo "${RED}usage✗${RST} │ ${COST_FMT}"; else echo "$COST_FMT"; fi
+    return
+  fi
   local parts=() seg L=""
 
   # Every window is independently optional, and Claude Code drops one once its
@@ -820,6 +840,9 @@ build_l2() {
     # No responses yet either — genuinely too early to know which case this is.
     L="${DIM}limits: waiting${RST}"
   fi
+  # After the window/throughput decision, so the flag alone never stands in for
+  # a plan window. Kept on every rung, the cost-only one included.
+  [ "$REFRESH_FAILED" = 1 ] && L="${L} │ ${RED}usage✗${RST}"
   echo "${L} │ ${COST_FMT}"
 }
 

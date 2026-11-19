@@ -22,12 +22,22 @@
 # with a terminal) is running — nobody is looking at a status line. A scheduled
 # run has no terminal, so it never counts itself.
 #
-# Prints only on failure, so a scheduler's log stays empty while it works. On the
-# status line, a figure that has stopped updating grows an age tag past 20 min.
-# The Codex part needs python3 and is skipped without it.
+# After the Claude refresh the cache is checked: refreshed just now, for the
+# signed-in account, and still in the shape the status line reads. A change of
+# shape after a Claude Code update would otherwise make the per-model limits
+# vanish without a trace — indistinguishable from a week with no such limit.
+#
+# Each run records its outcome in $STATUSLINE_REFRESH_STATUS_FILE (an empty
+# problem list when all went well); the status line shows `usage✗` while the
+# last run reported a problem. Problems are also printed, one line each, so a
+# scheduler's log stays empty while it works. A figure that has stopped updating
+# also grows an age tag on the status line past 20 minutes.
+# The Codex part needs python3 and is skipped without it; the checks need jq.
 set -u
 
 CODEX_FILE="${STATUSLINE_CODEX_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline/codex-rate-limits.json}"
+USAGE_FILE="${STATUSLINE_USAGE_FILE:-$HOME/.claude.json}"
+STATUS_FILE="${STATUSLINE_REFRESH_STATUS_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline/refresh-status.json}"
 TIMEOUT="${USAGE_REFRESH_TIMEOUT:-60}"  # seconds per call; a hung call must not outlive the schedule
 
 if ! ps -ax -o tty=,args= | awk '$1 != "??" && $2 == "claude" { found = 1 } END { exit !found }'; then
@@ -36,6 +46,14 @@ fi
 
 stamp() { date '+%F %T'; }
 status=0
+problems=()
+fail() {  # fail <source> <message>: print it and keep it for the status file
+  local message
+  message=$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-300)
+  printf '%s %s %s\n' "$(stamp)" "$1" "$message"
+  problems+=("$1: $message")
+  status=1
+}
 
 claude_bin=$(command -v claude || true)
 [ -z "$claude_bin" ] && [ -x "$HOME/.local/bin/claude" ] && claude_bin="$HOME/.local/bin/claude"
@@ -47,8 +65,23 @@ if [ -n "$claude_bin" ]; then
       --settings '{"disableAllHooks":true}') 2>&1 >/dev/null)
   rc=$?
   if [ "$rc" -ne 0 ]; then
-    printf '%s claude exit=%s %s\n' "$(stamp)" "$rc" "$(printf '%s' "$errors" | tr '\n' ' ' | cut -c1-300)"
-    status=1
+    fail claude "exit=$rc $errors"
+  else
+    # 300 s, not "this second": Claude Code skips the write when the cache was
+    # written less than a minute ago, so a refresh right after /usage is fine.
+    problem=$(jq -r --argjson now "$(date +%s)" '
+      (.cachedUsageUtilization // null) as $c
+      | (.oauthAccount | if type == "object" then .accountUuid else null end) as $account
+      | if ($c | type) != "object" then "no cachedUsageUtilization"
+        elif ($c.fetchedAtMs | type) != "number" then "no fetchedAtMs"
+        elif ($now - $c.fetchedAtMs / 1000) > 300 then "not refreshed (\(($now - $c.fetchedAtMs / 1000) | floor)s old)"
+        elif ($account | type) != "string" or $c.accountUuid != $account then "account does not match the signed-in one"
+        elif ($c.utilization | type) != "object" or ($c.utilization.limits | type) != "array"
+             or ([$c.utilization.limits[] | select(type == "object" and (.kind | type) == "string"
+                                                   and (.percent | type) == "number")] | length) == 0
+          then "shape not recognised (no limits[] entry with kind and percent)"
+        else empty end' "$USAGE_FILE" 2>&1) || problem="unreadable ($problem)"
+    [ -n "$problem" ] && fail claude "usage cache: $problem"
   fi
 fi
 
@@ -166,9 +199,16 @@ if [ -n "$codex_bin" ] && command -v python3 >/dev/null 2>&1; then
   errors=$(python3 -I -c "$CODEX_PY" "$codex_bin" "$CODEX_FILE" "$TIMEOUT" 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ]; then
-    printf '%s codex exit=%s %s\n' "$(stamp)" "$rc" "$(printf '%s' "$errors" | tr '\n' ' ' | cut -c1-300)"
-    status=1
+    fail codex "exit=$rc $errors"
   fi
 fi
+
+# ${problems[@]+...}: bash 3.2 treats an empty array as unbound under set -u.
+mkdir -p "$(dirname "$STATUS_FILE")" &&
+  status_tmp=$(mktemp "$STATUS_FILE.XXXXXX") &&
+  jq -n --argjson at "$(date +%s)" '{checkedAt: $at, problems: $ARGS.positional}' \
+     --args ${problems[@]+"${problems[@]}"} > "$status_tmp" &&
+  mv "$status_tmp" "$STATUS_FILE" ||
+  { printf '%s status file not written: %s\n' "$(stamp)" "$STATUS_FILE"; status=1; }
 
 exit "$status"

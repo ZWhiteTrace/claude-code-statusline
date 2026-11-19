@@ -17,9 +17,24 @@ cat > "$FAKES/ps" <<'EOF'
 cat "$FAKE_PS_FILE"
 EOF
 
+# Like the real one, a successful `claude -p /usage` rewrites the usage cache in
+# ~/.claude.json; FAKE_CLAUDE_CACHE picks what it leaves there.
 cat > "$FAKES/claude" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "$FAKE_LOG_DIR/claude-args"
+now_ms=$(( $(date +%s) * 1000 ))
+id1=00000000-0000-4000-8000-000000000001
+limits='[{"kind":"weekly_all","percent":40},{"kind":"weekly_scoped","percent":100}]'
+cache() { printf '{"fetchedAtMs":%s,"accountUuid":"%s","utilization":{"%s":%s}}' "$1" "$id1" "$2" "$limits"; }
+case "${FAKE_CLAUDE_CACHE:-ok}" in
+  ok)      body="{\"oauthAccount\":{\"accountUuid\":\"$id1\"},\"cachedUsageUtilization\":$(cache "$now_ms" limits)}" ;;
+  stale)   body="{\"oauthAccount\":{\"accountUuid\":\"$id1\"},\"cachedUsageUtilization\":$(cache $(( now_ms - 3600000 )) limits)}" ;;
+  shape)   body="{\"oauthAccount\":{\"accountUuid\":\"$id1\"},\"cachedUsageUtilization\":$(cache "$now_ms" windows)}" ;;
+  account) body="{\"oauthAccount\":{\"accountUuid\":\"00000000-0000-4000-8000-000000000002\"},\"cachedUsageUtilization\":$(cache "$now_ms" limits)}" ;;
+  missing) body="{\"oauthAccount\":{\"accountUuid\":\"$id1\"}}" ;;
+  garbage) body="not json" ;;
+esac
+printf '%s' "$body" > "$HOME/.claude.json"
 exit "${FAKE_CLAUDE_EXIT:-0}"
 EOF
 
@@ -80,7 +95,8 @@ run() {
   [ -f "$case_dir/ps" ] || printf '%s\n' "$INTERACTIVE" > "$case_dir/ps"
   OUT=$(env -i PATH="$FAKES:/usr/bin:/bin" HOME="$case_dir/home" \
         FAKE_PS_FILE="$case_dir/ps" FAKE_LOG_DIR="$case_dir/logs" FAKE_CODEX_RESULT="$RESULT" \
-        STATUSLINE_CODEX_FILE="$case_dir/cache/codex.json" USAGE_REFRESH_TIMEOUT=3 \
+        STATUSLINE_CODEX_FILE="$case_dir/cache/codex.json" STATUSLINE_REFRESH_STATUS_FILE="$case_dir/cache/status.json" \
+        USAGE_REFRESH_TIMEOUT=3 \
         "$@" /bin/bash "$SCRIPT" 2>&1)
   RC=$?
 }
@@ -104,11 +120,13 @@ check "重置次數取 availableCount（不是列出的張數）、最早到期�
 check "不存帳號 id、重置券 id" '! grep -qE "11111111-2222|RateLimitResetCredit_|accountId" "$F"'
 check "抓取時間是現在" '[ $(( $(jq .fetchedAt "$F") - NOW )) -ge 0 ] && [ $(( $(jq .fetchedAt "$F") - NOW )) -le 30 ]'
 check "檔案權限 600" '[ "$(stat -f %Lp "$F")" = "600" ]' "$(stat -f %Lp "$F")"
-check "沒有殘留暫存檔" '[ "$(find "$C/cache" -name ".codex-rate-limits.*" | wc -l | tr -d " ")" = 0 ]'
+check "沒有殘留暫存檔" '[ "$(find "$C/cache" -name ".codex-rate-limits.*" -o -name "status.json.*" | wc -l | tr -d " ")" = 0 ]'
+S="$C/cache/status.json"
+check "狀態檔：剛寫、沒有問題" '[ "$(jq -c ".problems" "$S")" = "[]" ] && [ $(( NOW - $(jq .checkedAt "$S") )) -le 30 ]' "$(cat "$S" 2>/dev/null)"
 
 echo "### 2. 沒有互動 session → 什麼都不做 ###"
 C="$WORK/idle"; mkdir -p "$C"; printf '%s\n' "$BACKGROUND_ONLY" > "$C/ps"; run "$C"
-check "exit 0、claude 與 codex 都沒被叫" '[ "$RC" = 0 ] && [ ! -e "$C/logs/claude-args" ] && [ ! -e "$C/logs/codex-methods" ] && [ ! -e "$C/cache/codex.json" ]' "rc=$RC"
+check "exit 0、claude 與 codex 都沒被叫、不寫狀態檔" '[ "$RC" = 0 ] && [ ! -e "$C/logs/claude-args" ] && [ ! -e "$C/logs/codex-methods" ] && [ ! -e "$C/cache/codex.json" ] && [ ! -e "$C/cache/status.json" ]' "rc=$RC"
 
 echo "### 3. Codex 回錯誤 / 沒有可用時窗 / 直接關閉 / 卡住 → 保留舊檔、exit 1、留一行 log ###"
 for mode in error empty close hang; do
@@ -117,6 +135,7 @@ for mode in error empty close hang; do
   check "${mode}：exit 1、舊檔原封不動、log 一行（${took}s）" \
     '[ "$RC" = 1 ] && [ "$(cat "$C/cache/codex.json")" = "{\"old\":true}" ] && [[ "$OUT" == *"codex exit=1"* ]] && [ "$(printf "%s\n" "$OUT" | grep -c "")" = 1 ]' "rc=$RC out=$OUT"
   check "${mode}：在時限內結束" '[ "$took" -le 10 ]' "${took}s"
+  check "${mode}：狀態檔只記下 codex 的問題" '[ "$(jq -r ".problems | length" "$C/cache/status.json")" = 1 ] && jq -r ".problems[0]" "$C/cache/status.json" | grep -q "^codex: exit=1"' "$(cat "$C/cache/status.json" 2>/dev/null)"
 done
 
 C="$WORK/codex-error-reason"; mkdir -p "$C/cache"; run "$C" FAKE_CODEX_MODE=error
@@ -125,6 +144,22 @@ check "錯誤回應：log 帶出伺服器說的原因" '[[ "$OUT" == *"not signe
 echo "### 4. claude 失敗不影響 Codex ###"
 C="$WORK/claude-fail"; run "$C" FAKE_CLAUDE_EXIT=3
 check "exit 1、log 寫 claude exit=3、Codex 照樣更新" '[ "$RC" = 1 ] && [[ "$OUT" == *"claude exit=3"* ]] && [ -s "$C/cache/codex.json" ]' "rc=$RC out=$OUT"
+check "狀態檔記下 claude 的問題" 'jq -r ".problems[0]" "$C/cache/status.json" | grep -q "^claude: exit=3"' "$(cat "$C/cache/status.json" 2>/dev/null)"
+
+echo "### 4b. claude 跑完了，但用量資料不對 → 記下原因（格式一變、靜默消失就靠這條抓） ###"
+for cache in stale shape account missing garbage; do
+  case $cache in
+    stale)   want="not refreshed" ;;
+    shape)   want="shape not recognised" ;;
+    account) want="account does not match" ;;
+    missing) want="no cachedUsageUtilization" ;;
+    garbage) want="unreadable" ;;
+  esac
+  C="$WORK/cache-$cache"; run "$C" FAKE_CLAUDE_CACHE="$cache"
+  check "${cache}：exit 1、log 與狀態檔都寫「${want}」、Codex 照樣更新" \
+    '[ "$RC" = 1 ] && [[ "$OUT" == *"claude usage cache: ${want}"* ]] && jq -r ".problems[0]" "$C/cache/status.json" | grep -q "^claude: usage cache: ${want}" && [ -s "$C/cache/codex.json" ]' \
+    "rc=$RC out=$OUT status=$(cat "$C/cache/status.json" 2>/dev/null)"
+done
 
 echo "### 5. 沒有 codex → 只更新 Claude ###"
 C="$WORK/no-codex"; NOCODEX="$WORK/bin-no-codex"; mkdir -p "$NOCODEX"; cp "$FAKES/ps" "$FAKES/claude" "$NOCODEX/"
