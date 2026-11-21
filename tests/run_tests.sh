@@ -459,6 +459,94 @@ for ((w = 20; w <= 40; w++)); do
 done
 [ "$bad" = 0 ] && echo "  PASS  20..40 欄都沒有被硬截" || FAIL=$((FAIL+1))
 
+echo "############ 重設提醒 →reset（≥95% 且離自然重置 ≥24h） ############"
+# The 24h edge is tested two minutes either side: the fixture is written a moment
+# before the render, so the exact second cannot be pinned.
+fable_at() {  # fable_at <file name> <percent> <seconds until reset> [more jq]
+  usage "$1" '.cachedUsageUtilization.utilization.limits[1] |= (.percent = '"$2"' | .resets_at = (($now + '"$3"') | todate))'"${4:+ | $4}"
+}
+codex_at() {  # codex_at <file name> <percent> <seconds until reset> [more jq]
+  cxfile "$1" '.windows[0] |= (.usedPercent = '"$2"' | .resetsAt = ($now + '"$3"'))'"${4:+ | $4}"
+}
+seven_at() { mut ".rate_limits.seven_day = {used_percentage:$1, resets_at:$(( $(date +%s) + $2 ))}"; }
+_expect() {  # _expect <name> <line> <expected substring, or !substring>...
+  local name=$1 l2=$2 want ok=1; shift 2
+  for want in "$@"; do
+    if [[ "$want" == "!"* ]]; then [[ "$l2" == *"${want#!}"* ]] && ok=0
+    else [[ "$l2" == *"$want"* ]] || ok=0; fi
+  done
+  if [ $ok = 1 ]; then echo "  PASS  $name: $l2"; else echo "  *** FAIL  $name: ${l2}（期望 $*）"; FAIL=$((FAIL+1)); fi
+}
+# The rest of the segment that starts with $2, up to the next separator.
+seg_of() { local s=${1#*"$2"}; [[ "$1" == *"$2"* ]] || s=""; printf '%s' "${s%%│*}"; }
+DAY=86400
+
+echo "### H1: 模型週額度（fable） ###"
+_ucheck "96%、離重置 3 天 → 亮" "$(fable_at h-on.json 96 $((3 * DAY)))" "fable: 96% ⟳" "→reset │"
+_ucheck "剛好 95% → 亮" "$(fable_at h-95.json 95 $((3 * DAY)))" "fable: 95% ⟳" "→reset"
+_ucheck "94% → 不亮" "$(fable_at h-94.json 94 $((3 * DAY)))" "fable: 94% ⟳" "!→reset"
+_ucheck "100%、離重置 24h 多兩分鐘 → 亮" "$(fable_at h-day-plus.json 100 $((DAY + 120)))" "fable: 100% ⟳" "→reset"
+_ucheck "100%、離重置差兩分鐘才滿 24h → 不亮" "$(fable_at h-day-minus.json 100 $((DAY - 120)))" "fable: 100% ⟳23h" "!→reset"
+_ucheck "重置時間格式不明 → 不亮" "$(fable_at h-noreset.json 96 $((3 * DAY)) '.cachedUsageUtilization.utilization.limits[1].resets_at = "soon"')" "fable: 96%" "!→reset"
+# Within a window the percentage only rises, so an old figure still counts.
+_ucheck "3 小時前的數字 → 照樣亮，年齡在後" "$(fable_at h-old.json 96 $((3 * DAY)) '.cachedUsageUtilization.fetchedAtMs -= 10800000')" "→reset (3h)"
+l2=$(_ul2 "$(fable_at h-two.json 96 $((3 * DAY)) '.cachedUsageUtilization.utilization.limits += [.cachedUsageUtilization.utilization.limits[1] | .percent = 30 | .scope.model.display_name = "Opus"]')" "$BASE")
+if [[ "$(seg_of "$l2" "fable:")" == *"→reset"* && "$(seg_of "$l2" "opus:")" == " 30% ⟳"* && "$(seg_of "$l2" "opus:")" != *"→reset"* ]]; then
+  echo "  PASS  兩個模型桶各自判斷: $l2"
+else echo "  *** FAIL  兩個模型桶沒有各自判斷: $l2"; FAIL=$((FAIL+1)); fi
+
+echo "### H2: 週總量（payload 的 7d） ###"
+NO_USAGE="$DIR/no-such-usage-file"
+_expect "96%、離重置 3 天 → 亮" "$(_ul2 "$NO_USAGE" "$(seven_at 96 $((3 * DAY)))")" "7d: 96% ⟳" "→reset │"
+_expect "96%、離重置 10 小時 → 不亮" "$(_ul2 "$NO_USAGE" "$(seven_at 96 36000)")" "7d: 96% ⟳" "!→reset"
+_expect "94% → 不亮" "$(_ul2 "$NO_USAGE" "$(seven_at 94 $((3 * DAY)))")" "7d: 94%" "!→reset"
+_expect "小數百分比 95.7 → 取整 95，亮" "$(_ul2 "$NO_USAGE" "$(seven_at 95.7 $((3 * DAY)))")" "7d: 95% ⟳" "→reset"
+_expect "沒有重置時間 → 不亮" "$(_ul2 "$NO_USAGE" "$(mut '.rate_limits.seven_day = {used_percentage:99}')")" "7d: 99%" "!→reset"
+# Without the integer check, bash arithmetic would evaluate this string to a time in 2100.
+_expect "重置時間不是純整數（字串運算式）→ 不亮" "$(_ul2 "$NO_USAGE" "$(mut '.rate_limits.seven_day = {used_percentage:99, resets_at:"4102444800-0"}')")" "7d: 99%" "!→reset"
+
+echo "### H3: Codex（看帳號還有沒有重置次數） ###"
+_ccheck "97%、離重置 4 天、有 3 次 → 亮，排在次數前" "$(codex_at hc-on.json 97 $((4 * DAY)))" "codex: 97% ⟳" "→reset · 3 resets │"
+_ccheck "沒有重置次數 → 不亮" "$(codex_at hc-none.json 97 $((4 * DAY)) '.resets.available = 0')" "codex: 97% ⟳" "!→reset" "!resets"
+_ccheck "離重置 10 小時 → 不亮" "$(codex_at hc-near.json 97 36000)" "codex: 97% ⟳" "!→reset"
+_ccheck "94% → 不亮" "$(codex_at hc-94.json 94 $((4 * DAY)))" "codex: 94%" "!→reset"
+l2=$(_cl2 "$(cxfile hc-two.json '.windows = [{usedPercent:99,windowMins:300,resetsAt:($now+10800)}, {usedPercent:96,windowMins:10080,resetsAt:($now+259200)}]')")
+if [[ "$(seg_of "$l2" "codex 5h:")" == " 99% ⟳"* && "$(seg_of "$l2" "codex 5h:")" != *"→reset"* && "$(seg_of "$l2" "codex 7d:")" == *"→reset · 3 resets"* ]]; then
+  echo "  PASS  5 小時時窗永遠不亮、週時窗亮: $l2"
+else echo "  *** FAIL  兩個時窗沒有各自判斷: $l2"; FAIL=$((FAIL+1)); fi
+
+echo "### H4: 降級時提醒跟著它的時窗走（倒數被丟了也還在） ###"
+H_USAGE=$(fable_at h4-usage.json 96 $((3 * DAY)))
+H_CODEX=$(codex_at h4-codex.json 97 $((4 * DAY)))
+H_SEVEN=$(seven_at 96 $((3 * DAY)))
+bad=0 no_countdown=0
+for ((w = 20; w <= 200; w++)); do
+  l2=$(_cl2 "$H_CODEX" "$H_SEVEN" "$H_USAGE" "$w")
+  for name in "7d:" "fable:" "codex:"; do
+    [[ "$l2" == *"$name"* ]] || continue
+    seg=$(seg_of "$l2" "$name")
+    if [[ "$seg" != *"→reset"* ]]; then echo "  *** FAIL  @ COLUMNS=$w ${name} 還在、提醒不見了 → $l2"; bad=1; break 2; fi
+    [[ "$seg" != *"⟳"* ]] && no_countdown=$((no_countdown + 1))
+  done
+done
+if [ "$no_countdown" -eq 0 ]; then echo "  *** FAIL  控制組：沒有任何寬度丟掉倒數，L1 以下測不到"; FAIL=$((FAIL+1))
+elif [ "$bad" = 0 ]; then echo "  PASS  20..200 欄提醒都跟著時窗（其中 $no_countdown 個段落已丟倒數）"
+else FAIL=$((FAIL+1)); fi
+
+echo "### H5: 寬度契約（三處全亮＋加購額度＋年齡） ###"
+USAGE_FILE_UNDER_TEST=$(fable_at h5-usage.json 100 $((3 * DAY)) '.cachedUsageUtilization.fetchedAtMs -= 1500000')
+CODEX_FILE_UNDER_TEST=$(cxfile h5-codex.json '.fetchedAt -= 1500 | .windows = [{usedPercent:12,windowMins:300,resetsAt:($now+3600)}, {usedPercent:97,windowMins:10080,resetsAt:($now+345600)}]')
+# Built in two steps: bash 3.2 misparses double quotes nested inside "$(... $(( $(date) )) ...)"
+# and brace-expands the jq program into four broken ones.
+H5_PAYLOAD=$(seven_at 96 $((3 * DAY)) | jq -c '.rate_limits.spend_limit = {used_percentage:88,resets_at:1790301600}')
+sweep "→reset 全亮" "$H5_PAYLOAD" 20 200
+# Control: the sweep only means something if all three hints are actually lit.
+l2=$(_cl2 "$CODEX_FILE_UNDER_TEST" "$H5_PAYLOAD" "$USAGE_FILE_UNDER_TEST" 200)
+marker="→reset" rest=${l2//→reset/}  # ${#} counts bytes or characters by locale; divide by the same measure
+if [ $(( (${#l2} - ${#rest}) / ${#marker} )) -eq 3 ]; then echo "  PASS  控制組：三處都亮: $l2"
+else echo "  *** FAIL  控制組：不是三處都亮，上面的掃描測不到提醒: $l2"; FAIL=$((FAIL+1)); fi
+unset USAGE_FILE_UNDER_TEST CODEX_FILE_UNDER_TEST
+
 echo "############ 背景更新失敗的警示 usage✗（讀 usage-refresh.sh 的狀態檔） ############"
 statusfile() {  # statusfile <file name> <jq expression building the object; $now is available>
   jq -n --argjson now "$(date +%s)" "$2" > "$USAGE_TMP/$1"

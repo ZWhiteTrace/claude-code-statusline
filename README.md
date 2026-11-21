@@ -100,6 +100,7 @@ Conditional fields appear only when they say something:
 | `fable: 100%` | the plan has a per-model weekly allowance (read from Claude Code's usage cache, see below) |
 | `credits: $2.50/$20` | usage credits are enabled and either some have been used or a window is full — the point where the next request on that model draws on them |
 | `codex: 4% ⟳5d16h · 3 resets` | `usage-refresh.sh` has recorded Codex usage. Two windows show as `codex 5h:` and `codex 7d:` |
+| `fable: 96% ⟳3d2h →reset` | a window is at 95% or more with at least 24 hours until it resets on its own: the point where spending a limit reset pays, or switching model when none is left. A 5-hour window never qualifies. A Codex window also needs a reset on the account; Claude's count is not in any cache the script can read, so its windows show the hint regardless |
 | `(25m)` | the figures before it are more than 20 minutes old (`m` / `h` / `d`). Claude's and Codex's are aged separately |
 | `usage✗` | the last `usage-refresh.sh` run, within a day, reported a problem — the reason is in `~/.cache/claude-statusline/refresh-status.json` |
 | `#123✗` | the branch has an open PR / MR, with its review state |
@@ -194,7 +195,7 @@ Line 2 is a second ruler exactly `BUDGET` wide, ending in `]`. If you can see th
 | Line | Order (least-to-most lossy) |
 |---|---|
 | L1 (identity) | Strip `Ctx: ` label → branch truncate 24→16 and repo 32→20 → abbreviate effort (`xhigh`→`X`) → compact model (`Opus 5 (1M)` → `O5·1M`) → drop repo → shrink `200k+` to `!` |
-| L2 (resources) | Drop reset countdowns and the Codex reset count → drop 7d, spend and credits (5h, per-model limits and Codex stay, so a plan that reports only 7d never loses its last window) → drop Codex → cost only. `usage✗` is kept on every rung |
+| L2 (resources) | Drop reset countdowns and the Codex reset count → drop 7d, spend and credits (5h, per-model limits and Codex stay, so a plan that reports only 7d never loses its last window) → drop Codex → cost only. `usage✗` is kept on every rung, and a `→reset` hint stays with its window |
 | L3 (usage) | Drop API wait % → drop `cold:` → drop cache expiry and miss detail → drop in/out tokens |
 | L4 (session) | Drop version → drop session duration → drop agent → drop worktree (git stats, lines `+/-`, unpushed count and PR state always kept) |
 

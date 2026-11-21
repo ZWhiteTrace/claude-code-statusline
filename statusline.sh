@@ -178,7 +178,7 @@ compact_model() {
 # path, and this user's repo and branch names are ASCII.
 #
 # The literals below are checked: ⚡ U+26A1 and 🌿 U+1F33F are the only EAW=W
-# glyphs the builders produce. ✓ ✗ ⟳ ░ are Neutral; █ │ · … are Ambiguous, which
+# glyphs the builders produce. ✓ ✗ ⟳ ░ are Neutral; █ │ · … → are Ambiguous, which
 # this script (like the terminals it targets) renders as one column.
 WIDE_CHARS='🌿⚡'
 
@@ -751,10 +751,41 @@ fi
 #   L0: full   L1: drop reset countdowns, Codex reset count / drop API duration
 #   L2: drop 7d, spend and credits (cloud only; 5h, per-model limits, Codex stay)
 #   L3: drop Codex   L4: only cost (and usage✗ when the last refresh failed)
+# A "→reset" hint stays with its window on every rung that shows the window.
 # ══════════════════════════════════════════════════════════════
 FIVE_INT=${FIVE_H_PCT%%.*}
 SEVEN_INT=${SEVEN_D_PCT%%.*}
 SPEND_INT=${SPEND_PCT%%.*}
+
+# === "→reset": the point where spending a limit reset pays ===
+# A window at RESET_HINT_PCT or more with RESET_HINT_MIN_LEFT or longer until it
+# resets on its own leaves that model unusable for a day or more. Earlier, a
+# reset refunds less than it could; closer to the natural reset, waiting it out
+# costs little. A 5-hour window never qualifies, so only weekly windows carry it.
+# Codex reports how many resets the account holds, and none means no hint.
+# Claude's count is in no cache this script can read (checked on 2.1.330), so its
+# windows show the hint regardless — with none left it still means "switch model".
+# An old figure counts as it is: within a window the percentage only rises.
+RESET_HINT_PCT=95
+RESET_HINT_MIN_LEFT=86400
+NOW=$(date +%s)
+reset_hint() {
+  local pct=$1 reset_epoch=$2
+  [[ "$pct" =~ ^[0-9]+$ ]] && [[ "$reset_epoch" =~ ^[0-9]+$ ]] || return 0
+  [ "$pct" -ge "$RESET_HINT_PCT" ] && [ $(( reset_epoch - NOW )) -ge "$RESET_HINT_MIN_LEFT" ] || return 0
+  printf ' %s→reset%s' "$RED" "$RST"
+}
+SEVEN_HINT=$(reset_hint "$SEVEN_INT" "$SEVEN_D_RESET")
+SC_HINTS=() CX_HINTS=()
+for ((i = 0; i < ${#SC_NAMES[@]}; i++)); do
+  SC_HINTS+=("$(reset_hint "${SC_PCTS[$i]}" "${SC_RESETS[$i]}")")
+done
+for ((i = 0; i < ${#CX_LABELS[@]}; i++)); do
+  _hint=""
+  [ "$CODEX_RESETS" -gt 0 ] && _hint=$(reset_hint "${CX_PCTS[$i]}" "${CX_RESETS[$i]}")
+  CX_HINTS+=("$_hint")
+done
+
 API_SEC=0
 TPS="?"
 if [ "$API_DURATION_MS" -gt 0 ]; then
@@ -782,7 +813,7 @@ build_l2() {
   if [ -n "$SEVEN_D_PCT" ] && [ $level -lt 2 ]; then
     seg="7d: $(cpct "$SEVEN_INT")"
     [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "$SEVEN_D_RESET")"
-    parts+=("$seg")
+    parts+=("${seg}${SEVEN_HINT}")
   fi
   if [ -n "$SPEND_PCT" ] && [ $level -lt 2 ]; then
     seg="spend: $(cpct "$SPEND_INT")"
@@ -798,7 +829,7 @@ build_l2() {
   for ((i = 0; i < ${#SC_NAMES[@]}; i++)); do
     seg="${SC_NAMES[$i]}: $(cpct "${SC_PCTS[$i]}")"
     [ $level -lt 1 ] && [ -n "${SC_RESETS[$i]}" ] && seg="${seg} ⟳$(fmt_reset "${SC_RESETS[$i]}")"
-    usage_segs+=("$seg")
+    usage_segs+=("${seg}${SC_HINTS[$i]}")
   done
   [ -n "$CREDIT_SEG" ] && [ $level -lt 2 ] && usage_segs+=("$CREDIT_SEG")
   if [ ${#usage_segs[@]} -gt 0 ]; then
@@ -814,7 +845,7 @@ build_l2() {
     for ((i = 0; i < ${#CX_LABELS[@]}; i++)); do
       seg="${CX_LABELS[$i]}: $(cpct "${CX_PCTS[$i]}")"
       [ $level -lt 1 ] && seg="${seg} ⟳$(fmt_reset "${CX_RESETS[$i]}")"
-      codex_segs+=("$seg")
+      codex_segs+=("${seg}${CX_HINTS[$i]}")
     done
   fi
   if [ ${#codex_segs[@]} -gt 0 ]; then
