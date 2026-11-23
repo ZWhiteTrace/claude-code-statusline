@@ -35,6 +35,7 @@ render() (
   STATUSLINE_USAGE_FILE="${USAGE_FILE_UNDER_TEST:-$DIR/no-such-usage-file}" \
     STATUSLINE_CODEX_FILE="${CODEX_FILE_UNDER_TEST:-$DIR/no-such-codex-file}" \
     STATUSLINE_REFRESH_STATUS_FILE="${STATUS_FILE_UNDER_TEST:-$DIR/no-such-status-file}" \
+    STATUSLINE_AGY_FILE="${AGY_FILE_UNDER_TEST:-$DIR/no-such-agy-file}" \
     STATUSLINE_CHROME_PAD="$PAD" COLUMNS="$2" bash "$SL" <<<"$1"
 )
 
@@ -604,9 +605,126 @@ for ((w = 20; w <= 200; w++)); do
 done
 [ "$bad" = 0 ] && echo "  PASS  20..200 欄都看得到 usage✗" || FAIL=$((FAIL+1))
 
+echo "############ agy 額度（只讀 agy 自己狀態列寫的檔，從不刷新） ############"
+agyfile() {  # agyfile <file name> [jq mutation; $now is available] [age in seconds, default 60]
+  local now; now=$(date +%s)
+  jq --argjson now "$now" '
+    .quota |= map_values(.reset_time = ($now + 259200 | todate) | .reset_in_seconds = 259200)
+    | '"${2:-.}" "$DIR/fixture-agy.json" > "$USAGE_TMP/$1"
+  python3 -c 'import os, sys, time; t = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$USAGE_TMP/$1" "${3:-60}"
+  printf '%s' "$USAGE_TMP/$1"
+}
+_al2() { ( AGY_FILE_UNDER_TEST=$1; CODEX_FILE_UNDER_TEST=${3:-}; USAGE_FILE_UNDER_TEST=${4:-}; render "${2:-$BASE}" "${5:-200}" ) | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g'; }
+_acheck() {  # _acheck <name> <agy file> <expected substring, or !substring>...
+  local name=$1 file=$2 l2 want ok=1; shift 2
+  l2=$(_al2 "$file")
+  for want in "$@"; do
+    if [[ "$want" == "!"* ]]; then [[ "$l2" == *"${want#!}"* ]] && ok=0
+    else [[ "$l2" == *"$want"* ]] || ok=0; fi
+  done
+  if [ $ok = 1 ]; then echo "  PASS  $name: $l2"; else echo "  *** FAIL  $name: ${l2}（期望 $*）"; FAIL=$((FAIL+1)); fi
+}
+
+echo "### A1: 控制組與基本顯示 ###"
+_acheck "基本 → gemini 與 claude，接在費用前、剛寫的不標年齡" "$(agyfile base.json)" "agy: gemini 1% · claude 0% │ \$1.23" "7d: 41%" "!agy✗" "!m)"
+_acheck "不給檔案 → 不顯示" "$DIR/no-such-agy-file" "!agy" "7d: 41%"
+_acheck "32.6% → 33%（跟 agy 自己的狀態列一樣四捨五入）" "$(agyfile round-up.json '.quota["gemini-weekly"].remaining_fraction = 0.674')" "gemini 33%"
+_acheck "32.4% → 32%" "$(agyfile round-down.json '.quota["gemini-weekly"].remaining_fraction = 0.676')" "gemini 32%"
+_acheck "用完 → 100%" "$(agyfile full.json '.quota["3p-weekly"].remaining_fraction = 0')" "claude 100%"
+_acheck "剩餘比例 <0 → 100%、>1 → 0%" "$(agyfile clamp.json '.quota["gemini-weekly"].remaining_fraction = -0.5 | .quota["3p-weekly"].remaining_fraction = 1.5')" "gemini 100%" "claude 0%"
+_acheck "argon 0% → 不顯示" "$(agyfile argon-idle.json)" "!argon"
+_acheck "argon 用了 → 排在 claude 後面" "$(agyfile argon.json '.quota["gemini-argon-wtu-weekly"].remaining_fraction = 0.88')" "claude 0% · argon 12%"
+_acheck "沒見過的週分組：用了才顯示，名字取自 ID" "$(agyfile new-group.json '.quota["Nova-Weekly"] = {remaining_fraction: 0.95, reset_time: ($now + 3600 | todate)} | .quota["idle-weekly"] = {remaining_fraction: 1, reset_time: ($now + 3600 | todate)}')" "claude 0% · nova 5%" "!idle"
+_acheck "ID 裡的怪字元被濾掉" "$(agyfile odd-name.json '.quota["Odd Name;x-weekly"] = {remaining_fraction: 0.93, reset_time: ($now + 3600 | todate)}')" "· oddnamex 7%"
+_acheck "5 小時時窗永遠不顯示" "$(agyfile five-hour.json '.quota["gemini-5h"].remaining_fraction = 0.5')" "agy: gemini 1% · claude 0%" "!50%"
+_acheck "停用的分組 → 不顯示" "$(agyfile disabled.json '.quota["gemini-weekly"].disabled = true')" "agy: claude 0%" "!gemini"
+_acheck "同一族兩個分組 → 取用量高的" "$(agyfile same-family.json '.quota["gemini-pro-weekly"] = {remaining_fraction: 0.6, reset_time: ($now + 3600 | todate)}')" "agy: gemini 40% · claude 0%"
+
+echo "### A2: 過時與過期 ###"
+_acheck "21 分鐘前 → 標年齡" "$(agyfile stale.json . 1260)" "claude 0% (21m) │"
+_acheck "3 天前 → (3d)" "$(agyfile days.json . 259300)" "claude 0% (3d) │"
+_acheck "10 分鐘前 → 不標" "$(agyfile recent.json . 600)" "agy: gemini" "!m)"
+_acheck "檔案時間在未來 → 不顯示" "$(agyfile future.json . -600)" "!agy"
+_acheck "一個分組已重置 → 只留另一個" "$(agyfile one-reset.json '.quota["gemini-weekly"].reset_time = "2000-01-01T00:00:00Z"')" "agy: claude 0%" "!gemini" "!agy✗"
+_acheck "全部已重置 → 不顯示（不是格式壞掉）" "$(agyfile all-reset.json '.quota |= map_values(.reset_time = "2000-01-01T00:00:00Z")')" "!agy"
+# Each source carries its own age: fresh Codex figures must not hide that agy's are days old.
+out=$(_al2 "$(agyfile own-age.json . 259300)" "$BASE" "$(cxfile own-age-agy-cx.json)")
+if [[ "$out" == *"· 3 resets │ agy: gemini 1% · claude 0% (3d) │ \$1.23"* ]]; then echo "  PASS  年齡各自計算: $out"
+else echo "  *** FAIL  年齡沒有各自計算: $out"; FAIL=$((FAIL+1)); fi
+
+echo "### A3: 格式變了 → agy✗（不能靜默消失），且不得弄壞 statusline ###"
+printf 'not json' > "$USAGE_TMP/agy-garbage.json"
+: > "$USAGE_TMP/agy-empty.json"
+for f in "$USAGE_TMP/agy-garbage.json" "$USAGE_TMP/agy-empty.json" \
+         "$(agyfile no-quota.json 'del(.quota)')" \
+         "$(agyfile quota-string.json '.quota = "x"')" \
+         "$(agyfile quota-empty.json '.quota = {}')" \
+         "$(agyfile root-array.json '[.]')" \
+         "$(agyfile fraction-string.json '.quota |= map_values(.remaining_fraction |= tostring)')" \
+         "$(agyfile reset-garbage.json '.quota |= map_values(.reset_time = "soon")')" \
+         "$(agyfile only-5h.json '.quota |= with_entries(select(.key | test("5h")))')"; do
+  out=$( AGY_FILE_UNDER_TEST=$f; render "$BASE" 200 )
+  n=$(printf '%s' "$out" | grep -c '')
+  l2=$(printf '%s\n' "$out" | sed -n 2p | sed $'s/\x1b\\[[0-9;]*m//g')
+  if [ "$n" = "4" ] && [[ "$l2" == *"7d: 41%"* ]] && [[ "$l2" == *"│ agy✗ │ \$1.23"* ]] && [[ "$l2" != *"agy:"* ]] && ! printf '%s' "$out" | grep -q "jq error"; then
+    echo "  PASS  $(basename "$f") → agy✗: $l2"
+  else
+    echo "  *** FAIL  $(basename "$f") → $n 行: $l2"; FAIL=$((FAIL+1))
+  fi
+done
+_acheck "只壞一個分組 → 其他照常、不亮 agy✗" "$(agyfile one-bad.json '.quota["gemini-weekly"].remaining_fraction = "x"')" "agy: claude 0%" "!agy✗" "!gemini"
+
+echo "### A4: 寬度契約（Claude 用量＋Codex＋agy 都在、都舊；以及 agy✗） ###"
+USAGE_FILE_UNDER_TEST=$(usage a4-usage.json '.cachedUsageUtilization.fetchedAtMs -= 1500000')
+CODEX_FILE_UNDER_TEST=$(cxfile a4-codex.json '.fetchedAt -= 1500 | .windows = [{usedPercent:12,windowMins:300,resetsAt:($now+3600)}, {usedPercent:4,windowMins:10080,resetsAt:($now+86400)}]')
+AGY_FILE_UNDER_TEST=$(agyfile a4-agy.json '.quota["gemini-argon-wtu-weekly"].remaining_fraction = 0.5' 259300)
+sweep "usage + codex + agy＋年齡" "$(mut '.rate_limits.spend_limit = {used_percentage:88,resets_at:1790301600}')" 20 200
+AGY_FILE_UNDER_TEST=$USAGE_TMP/agy-garbage.json
+sweep "usage + codex + agy✗" "$(mut '.rate_limits.spend_limit = {used_percentage:88,resets_at:1790301600}')" 20 200
+unset USAGE_FILE_UNDER_TEST CODEX_FILE_UNDER_TEST AGY_FILE_UNDER_TEST
+
+echo "### A5: agy 是第一個被丟的（其他段落一個都還沒丟時才有它） ###"
+A5_AGY=$(agyfile a5.json . 259300)
+seen_agy=0 seen_first=0 bad=0
+for ((w = 20; w <= 200; w++)); do
+  l2=$(_al2 "$A5_AGY" "$SEVEN_ONLY_U" "$X4_CODEX" "$X4_USAGE" "$w")
+  if [[ "$l2" == *"agy"* ]]; then
+    seen_agy=$((seen_agy + 1))
+    if [[ "$l2" != *"· 3 resets"* || "$l2" != *"7d: "*"⟳"* ]]; then
+      echo "  *** FAIL  @ COLUMNS=$w agy 還在、別的段落卻先被丟 → $l2"; bad=1; break
+    fi
+  elif [[ "$l2" == *"· 3 resets"* ]]; then
+    seen_first=$((seen_first + 1))
+  fi
+done
+if [ "$seen_agy" -eq 0 ] || [ "$seen_first" -eq 0 ]; then
+  echo "  *** FAIL  控制組：有 agy 的寬度 $seen_agy 個、只丟了 agy 的寬度 $seen_first 個，至少要各有一個"; FAIL=$((FAIL+1))
+elif [ "$bad" = 0 ]; then echo "  PASS  降級順序正確（有 agy $seen_agy 個寬度、只丟 agy $seen_first 個寬度）"
+else FAIL=$((FAIL+1)); fi
+
+echo "### A6: agy 不算方案時窗：沒有時窗時照樣顯示吞吐 ###"
+out=$(_al2 "$(agyfile no-window.json)" "$(mut 'del(.rate_limits)')")
+if [[ "$out" == "Speed: "*"tok/s"*"agy: gemini 1%"* ]]; then echo "  PASS  吞吐照常、agy 在旁邊: $out"
+else echo "  *** FAIL  agy 取代了吞吐顯示: $out"; FAIL=$((FAIL+1)); fi
+
+echo "### A7: 從不呼叫 agy（條款禁止第三方程式經 agy 的登入存取服務） ###"
+AGY_FAKE_BIN=$USAGE_TMP/fake-agy-bin
+mkdir -p "$AGY_FAKE_BIN"
+printf '#!/bin/bash\ntouch "$AGY_MARK"\n' > "$AGY_FAKE_BIN/agy"
+chmod +x "$AGY_FAKE_BIN/agy"
+# Control: the stand-in is found on PATH and leaves its mark when called.
+( export AGY_MARK=$USAGE_TMP/agy-control; PATH="$AGY_FAKE_BIN:$PATH" bash -c 'agy --version' )
+( export AGY_MARK=$USAGE_TMP/agy-called; PATH="$AGY_FAKE_BIN:$PATH"
+  for f in "$(agyfile a7.json)" "$(agyfile a7-old.json . 700000)" "$USAGE_TMP/agy-garbage.json" "$DIR/no-such-agy-file"; do
+    ( AGY_FILE_UNDER_TEST=$f; render "$BASE" 200 >/dev/null )
+  done )
+if [ ! -e "$USAGE_TMP/agy-control" ]; then echo "  *** FAIL  控制組：假的 agy 沒被叫到，這項測不到東西"; FAIL=$((FAIL+1))
+elif [ -e "$USAGE_TMP/agy-called" ]; then echo "  *** FAIL  statusline 呼叫了 agy"; FAIL=$((FAIL+1))
+else echo "  PASS  新的、舊的、壞的、沒有檔案，四種情況都沒有呼叫 agy"; fi
+
 echo "############ 使用者真實設定 ############"
 echo "### STATUSLINE_MAX_WIDTH=75 + SHORT_MODEL=1（settings.json 實際值） ###"
-out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" STATUSLINE_CODEX_FILE="$DIR/no-such-codex-file" STATUSLINE_REFRESH_STATUS_FILE="$DIR/no-such-status-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
+out=$( cd "$REPO_CWD" || exit 1; STATUSLINE_USAGE_FILE="$DIR/no-such-usage-file" STATUSLINE_CODEX_FILE="$DIR/no-such-codex-file" STATUSLINE_REFRESH_STATUS_FILE="$DIR/no-such-status-file" STATUSLINE_AGY_FILE="$DIR/no-such-agy-file" COLUMNS=132 STATUSLINE_MAX_WIDTH=75 STATUSLINE_SHORT_MODEL=1 bash "$SL" <<<"$BASE" )
 printf '%s\n' "$out"
 assert "user real settings" "$out" 70
 

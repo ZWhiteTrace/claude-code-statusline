@@ -728,6 +728,78 @@ fi
 [[ "$CODEX_RESETS" =~ ^[0-9]+$ ]] || CODEX_RESETS=0
 CODEX_AGE_TAG=$(age_tag "$CODEX_AGE")
 
+# === Antigravity (agy) usage: read from the file agy's own status line leaves ===
+# agy hands its status-line command a payload carrying the account's quota groups;
+# ~/.gemini/antigravity-cli/statusline.py saves each one, atomically, as
+# statusline-last.json. That file is the only source, and its mtime is its age.
+# 🔴 Never refresh it: no `agy` call, no use of its sign-in, no request to Google —
+# not from here, not from usage-refresh.sh, not on a schedule. Antigravity's terms
+# forbid reaching the service through third-party software (its FAQ names Claude
+# Code), and the account that would be suspended is the one holding the plan. So
+# the figures move only while agy itself is open, and nearly always carry an age.
+# Weekly groups only: by the time this reads the file a 5-hour window has almost
+# always rolled over. Within a week the percentage only rises, so an old figure is
+# a floor — except that use from another machine on the account is not in it. A
+# group past its reset is dropped. Gemini and Claude (agy's "3p" group, which also
+# covers GPT) always show; any other group only once it is in use. Percentages
+# round the way agy's own status line does, so the two never disagree.
+# A file in a shape this no longer reads shows agy✗ rather than going quiet.
+# skipped: agy reset countdowns and 5-hour windows, add when agy's own status line
+# is not enough to see them.
+AGY_FILE="${STATUSLINE_AGY_FILE:-$HOME/.gemini/antigravity-cli/statusline-last.json}"
+AGY_STATE="" AGY_GROUPS="" AGY_SEG=""
+if [ -f "$AGY_FILE" ]; then
+  AGY_OUT=$(jq -r --argjson now "$(date +%s)" '
+    def epoch: if type == "string"
+      then (sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)$"; "Z") | try fromdateiso8601 catch null)
+      else null end;
+    def family: ascii_downcase
+      | if test("argon") then "argon"
+        elif test("^3p|claude|anthropic|gpt|openai|third") then "claude"
+        elif test("gemini") then "gemini"
+        else sub("[-_]?weekly$"; "") | gsub("[^a-z0-9.-]"; "") | if . == "" then "other" else . end
+        end;
+    if type == "object" and (.quota | type) == "object" then
+      [ .quota | to_entries[]
+        | select((.key | ascii_downcase | test("week")) and (.value | type) == "object"
+                 and (.value.remaining_fraction | type) == "number"
+                 and (.value.reset_time | epoch) != null) ] as $weekly
+      | if ($weekly | length) == 0 then "AGY_STATE=broken"
+        else
+          [ $weekly[]
+            | select(.value.disabled != true and (.value.reset_time | epoch) > $now)
+            | ((1 - .value.remaining_fraction) * 100 | [., 0] | max | [., 100] | min) as $used
+            | { name: (.key | family),
+                pct: (if $used > 0 and $used < 1 then 1 else ($used + 0.5 | floor) end) } ]
+          | group_by(.name) | map(max_by(.pct))
+          | map(select(.name == "gemini" or .name == "claude" or .pct > 0))
+          | sort_by([(if .name == "gemini" then 0 elif .name == "claude" then 1 else 2 end), .name])
+          | map("\(.name) \(.pct)") | join(";")
+          | @sh "AGY_STATE=ok
+AGY_GROUPS=\(.)"
+        end
+    else "AGY_STATE=broken" end' "$AGY_FILE" 2>/dev/null)
+  [ -n "$AGY_OUT" ] || AGY_OUT="AGY_STATE=broken"
+  eval "$AGY_OUT"
+  if [ "$AGY_STATE" = broken ]; then
+    AGY_SEG="${RED}agy✗${RST}"
+  elif [ -n "$AGY_GROUPS" ]; then
+    _agy_mtime=$(stat -f%m "$AGY_FILE" 2>/dev/null || stat -c%Y "$AGY_FILE" 2>/dev/null)
+    _agy_now=$(date +%s)
+    # A file stamped in the future has no age to show, like a Codex fetch time there.
+    if [[ "$_agy_mtime" =~ ^[0-9]+$ ]] && [ "$_agy_mtime" -le "$_agy_now" ]; then
+      IFS=';' read -r -a _agy_entries <<<"$AGY_GROUPS"
+      for _entry in "${_agy_entries[@]}"; do
+        read -r _name _pct <<<"$_entry"
+        [[ "$_pct" =~ ^[0-9]+$ ]] || continue
+        if [ -n "$AGY_SEG" ]; then AGY_SEG="${AGY_SEG} · "; else AGY_SEG="agy: "; fi
+        AGY_SEG="${AGY_SEG}${_name} $(cpct "$_pct")"
+      done
+      [ -n "$AGY_SEG" ] && AGY_SEG="${AGY_SEG}$(age_tag $(( _agy_now - _agy_mtime )))"
+    fi
+  fi
+fi
+
 # === Did the last usage refresh report a problem? ===
 # usage-refresh.sh records each run's outcome, including "the Claude usage cache
 # is no longer in a shape this script reads". Without this flag that case is
@@ -751,6 +823,8 @@ fi
 #   L0: full   L1: drop reset countdowns, Codex reset count / drop API duration
 #   L2: drop 7d, spend and credits (cloud only; 5h, per-model limits, Codex stay)
 #   L3: drop Codex   L4: only cost (and usage✗ when the last refresh failed)
+# agy's usage is tried first on top of L0 and is the first thing dropped: its
+# figures are the oldest here and the least likely to decide anything.
 # A "→reset" hint stays with its window on every rung that shows the window.
 # ══════════════════════════════════════════════════════════════
 FIVE_INT=${FIVE_H_PCT%%.*}
@@ -794,7 +868,7 @@ if [ "$API_DURATION_MS" -gt 0 ]; then
 fi
 
 build_l2() {
-  local level=$1
+  local level=$1 with_agy=${2:-0}
   if [ $level -ge 4 ]; then
     if [ "$REFRESH_FAILED" = 1 ]; then echo "${RED}usage✗${RST} │ ${COST_FMT}"; else echo "$COST_FMT"; fi
     return
@@ -871,16 +945,22 @@ build_l2() {
     # No responses yet either — genuinely too early to know which case this is.
     L="${DIM}limits: waiting${RST}"
   fi
+  # agy is not a Claude plan window either, so it also goes after that decision.
+  [ "$with_agy" = 1 ] && [ -n "$AGY_SEG" ] && L="${L} │ ${AGY_SEG}"
   # After the window/throughput decision, so the flag alone never stands in for
   # a plan window. Kept on every rung, the cost-only one included.
   [ "$REFRESH_FAILED" = 1 ] && L="${L} │ ${RED}usage✗${RST}"
   echo "${L} │ ${COST_FMT}"
 }
 
-for _lvl in 0 1 2 3 4; do
-  L2=$(build_l2 $_lvl)
-  [ "$(visible_len "$L2")" -le "$BUDGET" ] && break
-done
+L2=""
+[ -n "$AGY_SEG" ] && L2=$(build_l2 0 1)
+if [ -z "$L2" ] || [ "$(visible_len "$L2")" -gt "$BUDGET" ]; then
+  for _lvl in 0 1 2 3 4; do
+    L2=$(build_l2 $_lvl)
+    [ "$(visible_len "$L2")" -le "$BUDGET" ] && break
+  done
+fi
 L2=$(clamp_line "$L2" "$BUDGET")
 
 # ══════════════════════════════════════════════════════════════

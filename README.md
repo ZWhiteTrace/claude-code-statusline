@@ -60,6 +60,7 @@ Benchmarked on macOS 15 (Darwin 24.5.0), bash 3.2, jq 1.7.
 - **Rate limits per window** — `5h` / `7d` / gateway `spend`. Each is independently optional and Claude Code drops a window once it resets, so they are read individually rather than gated on one another
 - **Per-model weekly limits and usage credits** — `fable: 100%` and `credits: $2.50/$20`, which the status line payload does not carry. On a plan where one model has its own weekly allowance, the overall `7d` can read 60% while that model is already at 100% and its requests are drawing on credits. See [Per-model limits](#per-model-limits) for where the figures come from and how far to trust them
 - **Codex usage alongside** — `codex: 4% ⟳5d16h · 3 resets`: the Codex weekly (and 5-hour, where the plan has one) window, its reset time, and how many free resets the account holds. Read from a small file that [`usage-refresh.sh`](#keeping-the-usage-figures-fresh) writes
+- **Antigravity (`agy`) usage alongside** — `agy: gemini 1% · claude 0% (3d)`: the weekly quota groups of the Antigravity CLI, Claude standing for its third-party (`3p`) group, which also covers GPT; any other group shows once it is in use. agy hands its own status-line command a payload with these groups; this reads the copy that command saves to `~/.gemini/antigravity-cli/statusline-last.json` (`STATUSLINE_AGY_FILE` overrides), and the file's mtime is the figures' age. **It is never refreshed** — no `agy` call, no use of its sign-in, nothing sent to Google — because Antigravity's terms forbid third-party software reaching the service through it, and its FAQ names Claude Code. So the figures move only while agy is open and usually carry an age; within a week they only rise, so an old one is a floor, except for use on another machine. A group past its reset is dropped; a file in a shape the script no longer reads shows a red `agy✗` instead of going quiet. agy is the first thing dropped when line 2 runs out of room
 - **Open PR / MR state** — `#123✓` approved, `#123✗` changes requested, `#123·draft`
 - **Unpushed commits** — `↑2` means those commits exist only on this machine. Deliberately without a "behind" count: `origin/*` only moves on fetch, so a behind figure would report the state at the last fetch and read as an all-clear the script cannot give
 - **Auto-adapts** for cloud Claude (shows rate limits) vs local Ollama or an API key (shows inference tok/s, since no plan limits exist there)
@@ -101,7 +102,9 @@ Conditional fields appear only when they say something:
 | `credits: $2.50/$20` | usage credits are enabled and either some have been used or a window is full — the point where the next request on that model draws on them |
 | `codex: 4% ⟳5d16h · 3 resets` | `usage-refresh.sh` has recorded Codex usage. Two windows show as `codex 5h:` and `codex 7d:` |
 | `fable: 96% ⟳3d2h →reset` | a window is at 95% or more with at least 24 hours until it resets on its own: the point where spending a limit reset pays, or switching model when none is left. A 5-hour window never qualifies. A Codex window also needs a reset on the account; Claude's count is not in any cache the script can read, so its windows show the hint regardless |
-| `(25m)` | the figures before it are more than 20 minutes old (`m` / `h` / `d`). Claude's and Codex's are aged separately |
+| `agy: gemini 1% · claude 0% (3d)` | agy's own status line has saved its payload (see above); never refreshed from here, so it usually carries an age |
+| `agy✗` | that file is there but no longer in a shape the script reads |
+| `(25m)` | the figures before it are more than 20 minutes old (`m` / `h` / `d`). Claude's, Codex's and agy's are aged separately |
 | `usage✗` | the last `usage-refresh.sh` run, within a day, reported a problem — the reason is in `~/.cache/claude-statusline/refresh-status.json` |
 | `#123✗` | the branch has an open PR / MR, with its review state |
 | `↑2` | commits exist locally that are not on the upstream |
@@ -195,7 +198,7 @@ Line 2 is a second ruler exactly `BUDGET` wide, ending in `]`. If you can see th
 | Line | Order (least-to-most lossy) |
 |---|---|
 | L1 (identity) | Strip `Ctx: ` label → branch truncate 24→16 and repo 32→20 → abbreviate effort (`xhigh`→`X`) → compact model (`Opus 5 (1M)` → `O5·1M`) → drop repo → shrink `200k+` to `!` |
-| L2 (resources) | Drop reset countdowns and the Codex reset count → drop 7d, spend and credits (5h, per-model limits and Codex stay, so a plan that reports only 7d never loses its last window) → drop Codex → cost only. `usage✗` is kept on every rung, and a `→reset` hint stays with its window |
+| L2 (resources) | Drop agy's usage → drop reset countdowns and the Codex reset count → drop 7d, spend and credits (5h, per-model limits and Codex stay, so a plan that reports only 7d never loses its last window) → drop Codex → cost only. `usage✗` is kept on every rung, and a `→reset` hint stays with its window |
 | L3 (usage) | Drop API wait % → drop `cold:` → drop cache expiry and miss detail → drop in/out tokens |
 | L4 (session) | Drop version → drop session duration → drop agent → drop worktree (git stats, lines `+/-`, unpushed count and PR state always kept) |
 
@@ -332,11 +335,13 @@ It ages: if Claude Code changes the payload shape the suite stays green while
 testing a format that no longer exists. Recapture by having the script write its
 stdin to a file once, then removing that line.
 
-`tests/fixture-usage.json` stands in for `~/.claude.json` and
-`tests/fixture-codex.json` for the Codex file; both are synthetic (fake account
-id, made-up figures). The suite rewrites their times relative to now on every run
-and pins `STATUSLINE_USAGE_FILE` and `STATUSLINE_CODEX_FILE` for every case, so no
-test ever reads the real files on the machine running it.
+`tests/fixture-usage.json` stands in for `~/.claude.json`,
+`tests/fixture-codex.json` for the Codex file and `tests/fixture-agy.json` for
+agy's; all are synthetic (fake account id, made-up figures). The suite rewrites
+their times relative to now on every run and pins `STATUSLINE_USAGE_FILE`,
+`STATUSLINE_CODEX_FILE` and `STATUSLINE_AGY_FILE` for every case, so no test ever
+reads the real files on the machine running it. Both suites also put a fake `agy`
+on `PATH` and fail if anything calls it.
 
 `test_usage_refresh.sh` puts fake `ps`, `claude` and `codex` first on `PATH`, so
 the script runs its real process check and its real JSON-RPC exchange against a
@@ -386,7 +391,7 @@ The 4-line layout groups fields by semantic role so each line has a single theme
 | Line | Theme | Fields |
 |---|---|---|
 | L1 | **Identity & capacity** | Model, effort, mode flags, long-context marker, Repo:Branch, context window |
-| L2 | **Resource consumption** | 5h / 7d / spend windows, per-model weekly limits, usage credits, Codex usage (or inference speed where no plan limits exist), session cost |
+| L2 | **Resource consumption** | 5h / 7d / spend windows, per-model weekly limits, usage credits, Codex usage, agy usage (or inference speed where no plan limits exist), session cost |
 | L3 | **Usage & cache** | Tokens in/out, cache hit rate, TTL and expiry, misses with cause, re-cache cost, API wait % |
 | L4 | **Session state** | Duration, lines changed, git stats, unpushed commits, PR state, worktree, agent, version |
 

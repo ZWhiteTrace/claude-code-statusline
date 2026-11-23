@@ -62,7 +62,14 @@ while IFS= read -r line; do
   esac
 done
 EOF
-chmod +x "$FAKES/ps" "$FAKES/claude" "$FAKES/codex"
+# agy must never be called: the status line only reads the file agy's own status
+# line writes (Antigravity's terms forbid third-party software reaching the
+# service through its sign-in). This stand-in records any call; section 8 checks.
+cat > "$FAKES/agy" <<'EOF'
+#!/bin/bash
+touch "$FAKE_LOG_DIR/agy-called"
+EOF
+chmod +x "$FAKES/ps" "$FAKES/claude" "$FAKES/codex" "$FAKES/agy"
 
 NOW=$(date +%s)
 RESULT="$WORK/result.json"
@@ -187,6 +194,13 @@ else
   check "consume 被拒絕、沒有送出、沒有寫檔" \
     '[ "$rc" != 0 ] && [[ "$out" == *"refusing to send account/rateLimitResetCredit/consume"* ]] && ! grep -q consume "$C/logs/codex-methods" && [ ! -e "$C/out.json" ]' "rc=$rc out=$out"
 fi
+
+echo "### 8. 從不呼叫 agy（agy 的額度只讀 agy 自己寫的檔，不刷新） ###"
+C="$WORK/agy-control"; mkdir -p "$C"
+env -i PATH="$FAKES:/usr/bin:/bin" FAKE_LOG_DIR="$C" /bin/bash -c 'agy --version'
+check "對照組：假的 agy 在 PATH 上找得到、被叫會留記號" '[ -e "$C/agy-called" ]'
+called=$(find "$WORK" -name agy-called -not -path "$C/*")
+check "以上所有情境都沒有呼叫 agy" '[ -z "$called" ]' "$called"
 
 echo "================================"
 echo "PASS=$PASS  FAIL=$FAIL"
